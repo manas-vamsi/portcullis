@@ -1,0 +1,6 @@
+{
+  "name": "portcullis",
+  "version": "0.1.0",
+  "description": "Policy, approval and audit layer for agent tool calls. Day-one stub: logs every call, decides nothing.",
+  "repository": "https://github.com/manas-vamsi/portcullis"
+}

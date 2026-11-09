@@ -1,0 +1,18 @@
+{
+  "description": "Log every tool call. Makes no allow/deny decision yet.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/log_tool_call.py"],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
