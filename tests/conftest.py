@@ -12,17 +12,22 @@ import psycopg
 import pytest
 from langgraph.checkpoint.postgres import PostgresSaver
 
-CREATE_EFFECTS_TABLE = """
-CREATE TABLE IF NOT EXISTS test_effects (
-    run_id text NOT NULL,
-    effect text NOT NULL,
-    at timestamptz NOT NULL DEFAULT now()
+# Stand-in for an external system. idem_key lets a "keyed" fake provider deduplicate like a payment API.
+TEST_EFFECTS_SETUP = (
+    """CREATE TABLE IF NOT EXISTS test_effects (
+        run_id text NOT NULL,
+        effect text NOT NULL,
+        at timestamptz NOT NULL DEFAULT now()
+    )""",
+    "ALTER TABLE test_effects ADD COLUMN IF NOT EXISTS idem_key text",
+    "CREATE UNIQUE INDEX IF NOT EXISTS test_effects_idem_key ON test_effects (idem_key) WHERE idem_key IS NOT NULL",
 )
-"""
 
 
 @pytest.fixture(scope="session")
 def postgres_url() -> str:
+    from portcullis.idempotency import create_ledger
+
     url = os.environ.get("PORTCULLIS_DATABASE_URL")
     if not url:
         pytest.skip("PORTCULLIS_DATABASE_URL not set (see .env.example); Postgres tests skipped")
@@ -33,5 +38,7 @@ def postgres_url() -> str:
     with PostgresSaver.from_conn_string(url) as saver:
         saver.setup()
     with psycopg.connect(url, autocommit=True) as conn:
-        conn.execute(CREATE_EFFECTS_TABLE)
+        create_ledger(conn)
+        for statement in TEST_EFFECTS_SETUP:
+            conn.execute(statement)
     return url
