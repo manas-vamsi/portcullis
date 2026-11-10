@@ -31,9 +31,9 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 | Human approval | Irreversible actions and spend above a threshold wait for an explicit approve or deny | Engine returns `ask`; approval flow planned |
 | Tamper-evident audit log | Hash-chained records of who approved what and when | Planned |
 | Budgets and loop detection | Limits on steps, tokens and time, enforced by the runtime | Decision logic built; runtime counters planned |
-| Idempotency keys | A crash and resume does not repeat a side effect | Planned (a test marked expected-fail pins the gap) |
+| Idempotency keys | A crash and resume does not repeat a side effect | Built as a library (Postgres ledger); not yet wired into the agent runtime |
 | Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Hash check built; reading MCP definitions planned |
-| Crash recovery | Resume a run from a Postgres checkpoint (LangGraph) | Resume after a kill is tested; a step killed mid-way still repeats its side effect until idempotency lands |
+| Crash recovery | Resume a run from a Postgres checkpoint (LangGraph) | Tested with a hard-killed worker, including the repeat-effect cases below |
 | Tracing | Every run can be inspected end to end (OpenTelemetry) | Planned |
 | Eval gate | Block a release if the agent got measurably worse | Planned |
 
@@ -101,6 +101,9 @@ Teams that run agents with real side effects and need control and evidence: mult
 
 - The spend threshold is checked per call, on one named argument. There is no cumulative spend cap yet, so many small calls can add up.
 - Loop detection compares the tool name and arguments. A model can vary the arguments to avoid it. The step budget is the hard stop.
+- Delivery is at-least-once, not exactly-once. If the process dies after a tool call but before the ledger records it, the call is retried with the same idempotency key. The outside service must deduplicate by that key; one that ignores keys can see one duplicate. A test pins this.
+- A call that keeps failing is retried on every resume. There is no per-call retry cap yet.
+- The ledger assumes a call id that stays the same across a resume. Wiring it to LangGraph's tool call ids is not done or verified yet.
 - The engine trusts its caller for the tenant and for the hash of the live tool definition. These must come from the runtime (authenticated identity, the real MCP definition), never from model output.
 
 ## Stack
