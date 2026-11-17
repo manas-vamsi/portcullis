@@ -14,7 +14,8 @@ not allowed, so budgets and loop detection cover every attempt. A breach halts t
 pauses the graph with interrupt() until a human answers {"approved": True, "by": "<name>"};
 anything else counts as a denial. Approvals are recorded in state["approvals"] and never sent
 to the model, which sees only a rule code for a refusal. Allowed and approved calls run through
-the idempotency ledger. Its call id is the message and call position in the checkpointed history
+the idempotency ledger, and each one that ran adds its amount to state["spend"], which the policy's
+optional max_spend cap is checked against. Its call id is the message and call position in the checkpointed history
 (m3-c0), never the model's own tool-call id, because models can reuse ids.
 
 Every call is written to the hash-chained audit log (portcullis.audit): the decision before
@@ -57,7 +58,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from portcullis.audit import AuditTrail
 from portcullis.idempotency import idempotency_key, run_once
 from portcullis.llm import LLM
-from portcullis.policy import Decision, Policy, RunState, ToolCall, Verdict, decide, definition_hash, fingerprint
+from portcullis.policy import (
+    Decision,
+    Policy,
+    RunState,
+    ToolCall,
+    Verdict,
+    decide,
+    definition_hash,
+    fingerprint,
+    spend_amount,
+)
 
 Tool = Callable[[dict[str, Any], str], Any]  # (args, idempotency key) -> JSON-compatible result
 Definitions = Callable[[str], Mapping[str, Any] | None]  # tool name -> its definition as advertised now
@@ -75,6 +86,7 @@ class AgentState(TypedDict):
     messages: list[dict[str, Any]]
     steps: int
     tokens: int
+    spend: float  # total amount of the calls that ran; a float so the checkpoint never meets a huge int
     seconds: float  # model time plus tool time of a node's final pass; waiting for a human is not counted
     history: list[str]  # fingerprints of the calls made so far
     approvals: list[dict[str, Any]]  # who approved which call; never sent to the model
@@ -128,6 +140,7 @@ def initial_state(tenant_id: str, run_id: str, user_message: str) -> AgentState:
         "messages": [{"role": "user", "content": user_message}],
         "steps": 0,
         "tokens": 0,
+        "spend": 0.0,
         "seconds": 0.0,
         "history": [],
         "approvals": [],
@@ -243,14 +256,14 @@ def _answer(
     position_id: str,
     message_id: str,
     trail: AuditTrail,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """The tool message for one call, plus the approval record if a human approved it."""
+) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+    """The tool message for one call, the approval record if a human approved it, and whether the tool ran."""
     if decision.rule in HALTING_RULES:
-        return _refusal(message_id, decision.rule), None
+        return _refusal(message_id, decision.rule), None, False
     if call is None:
-        return _refusal(message_id, "invalid_tool_call"), None
+        return _refusal(message_id, "invalid_tool_call"), None, False
     if decision.verdict is Verdict.DENY:
-        return _refusal(message_id, decision.rule), None
+        return _refusal(message_id, decision.rule), None, False
     tool = tools.get(call.name)
     if tool is None:
         trail.record(
@@ -258,7 +271,7 @@ def _answer(
             "refused",
             {"call_id": position_id, "tool": call.name, "rule": "tool_unavailable"},
         )
-        return _refusal(message_id, "tool_unavailable"), None
+        return _refusal(message_id, "tool_unavailable"), None, False
     approval = None
     if decision.verdict is Verdict.ASK:
         approved, by = _approver(state, call, position_id, decision)
@@ -268,7 +281,7 @@ def _answer(
             {"call_id": position_id, "tool": call.name, "approved": approved, "approved_by": by},
         )
         if not approved:
-            return _refusal(message_id, "approval_denied"), None
+            return _refusal(message_id, "approval_denied"), None, False
         approval = {"call_id": position_id, "tool": call.name, "args": call.args, "approved_by": by}
     try:
         message = _execute(conn, tool, state, position_id, call)
@@ -281,7 +294,7 @@ def _answer(
     key = idempotency_key(state["run_id"], _ledger_call_id(state, position_id))
     executed = {"call_id": position_id, "tool": call.name, "idempotency_key": key}
     trail.record(f"{position_id}:executed", "executed", executed)
-    return message, approval
+    return message, approval, True
 
 
 def _tokens(reply: dict[str, Any]) -> int:
@@ -320,7 +333,7 @@ def make_tools_node(
         started = time.perf_counter()
         position = len(state["messages"]) - 1
         messages, history, approvals = list(state["messages"]), list(state["history"]), list(state["approvals"])
-        steps, halted = state["steps"], None
+        steps, spend, halted = state["steps"], state["spend"], None
         trail = AuditTrail(conn, state["run_id"], state["tenant_id"])
 
         for index, raw in enumerate(state["messages"][-1]["tool_calls"]):
@@ -333,17 +346,18 @@ def make_tools_node(
                 messages.append(_refusal(message_id, "run_halted"))
                 continue
             run_state = RunState(
-                steps=steps, tokens=state["tokens"], seconds=state["seconds"], history=tuple(history)
+                steps=steps, tokens=state["tokens"], seconds=state["seconds"], history=tuple(history), spend=spend
             )
             seen = _live_hash(definitions, name) if call else None
-            decision = decide(
-                policy, ToolCall(tenant_id=state["tenant_id"], tool=name, args=args, definition_sha256=seen), run_state
-            )
+            tool_call = ToolCall(tenant_id=state["tenant_id"], tool=name, args=args, definition_sha256=seen)
+            decision = decide(policy, tool_call, run_state)
             _log_decision(trail, position_id, name, args, decision, seen)  # written before anything runs
             steps += 1
             history.append(fingerprint(name, args))
 
-            message, approval = _answer(state, conn, tools, call, decision, position_id, message_id, trail)
+            message, approval, ran = _answer(state, conn, tools, call, decision, position_id, message_id, trail)
+            if ran:
+                spend += float(spend_amount(policy, tool_call))
             messages.append(message)
             if approval:
                 approvals.append(approval)
@@ -352,6 +366,7 @@ def make_tools_node(
         return {
             "messages": messages,
             "steps": steps,
+            "spend": spend,
             "history": history,
             "approvals": approvals,
             "halted": halted,

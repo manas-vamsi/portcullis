@@ -80,6 +80,10 @@ class Budget(_Frozen):
     max_tokens: int = Field(gt=0)
     max_seconds: float = Field(gt=0, allow_inf_nan=False)
     max_identical_calls: int = Field(gt=0)
+    # Cap on the total amount spent in one run, counted from the amount argument of tools that declare an
+    # approve_above threshold. None means no cap. A human approval cannot exceed it. Per run, not per
+    # tenant or per day: a new run starts at zero.
+    max_spend: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class TenantPolicy(_Frozen):
@@ -104,6 +108,7 @@ class RunState(_Frozen):
     tokens: int = Field(default=0, ge=0)
     seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
     history: tuple[str, ...] = ()  # fingerprints of calls already made in this run
+    spend: float = Field(default=0, ge=0, allow_inf_nan=False)  # total amount of the calls that already ran
 
 
 class Decision(_Frozen):
@@ -181,6 +186,30 @@ def _check_amount(rule: ToolRule, call: ToolCall) -> Decision | None:
     )
 
 
+def _check_spend(budget: Budget, rule: ToolRule, call: ToolCall, state: RunState) -> Decision | None:
+    threshold = rule.approve_above
+    if budget.max_spend is None or threshold is None:
+        return None
+    amount = call.args[threshold.arg]  # validated by _check_amount
+    if state.spend + amount <= budget.max_spend:
+        return None
+    return _decision(
+        Verdict.DENY,
+        "spend_cap_exceeded",
+        f"spend so far {state.spend} plus {amount} would pass the run's cap of {budget.max_spend}",
+    )
+
+
+def spend_amount(policy: Policy, call: ToolCall) -> float:
+    """What a call that ran adds to the run's spend. Zero when the tool declares no amount or it is invalid."""
+    tenant = policy.tenants.get(call.tenant_id)
+    rule = tenant.tools.get(call.tool) if tenant else None
+    if rule is None or rule.approve_above is None:
+        return 0
+    amount = call.args.get(rule.approve_above.arg)
+    return amount if _is_valid_amount(amount) else 0
+
+
 def _argument_text(call: ToolCall, name: str) -> str | None:
     value = call.args.get(name)
     if value is None:
@@ -221,7 +250,7 @@ def _check_approval(rule: ToolRule, call: ToolCall) -> Decision | None:
     if rule.risk is Risk.IRREVERSIBLE:
         return _decision(Verdict.ASK, "irreversible_action", f"{call.tool!r} cannot be undone")
     threshold = rule.approve_above
-    # ponytail: per-call limit on one named argument; add a cumulative cap (RunState) if needed.
+    # The per-call limit on one named argument; the run's total is capped by _check_spend.
     if threshold is not None and call.args[threshold.arg] > threshold.limit:  # validated by _check_amount
         return _decision(
             Verdict.ASK,
@@ -249,6 +278,7 @@ def _decide(policy: Policy, call: ToolCall, state: RunState) -> Decision:
     return (
         _check_pin(rule, call)
         or _check_amount(rule, call)
+        or _check_spend(tenant.budget, rule, call, state)
         or _check_arguments(rule, call)
         or _check_approval(rule, call)
         or _check_sensitive(rule, call)

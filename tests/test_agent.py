@@ -537,3 +537,73 @@ def test_a_call_with_no_definition_has_no_hash_in_the_log(conn, run_id):
     h = Harness(conn, run_id, [reply(tool_call("t1", "create_work_order", cost=100)), reply(content="done")])
     h.start()
     assert "definition_sha256" not in audit_events(conn, run_id)[0][1]
+
+
+# --- cumulative spend cap ---
+
+
+def spend_policy(cap) -> Policy:
+    base = make_policy()
+    return Policy(
+        tenants={n: t.model_copy(update={"budget": t.budget.model_copy(update={"max_spend": cap})}) for n, t in base.tenants.items()}
+    )
+
+
+def orders(*costs: int) -> list[dict]:
+    return [tool_call(f"t{i}", "create_work_order", cost=cost, unit=str(i)) for i, cost in enumerate(costs)]
+
+
+def test_orders_in_one_message_are_added_up_against_the_cap(conn, run_id):
+    h = Harness(conn, run_id, [reply(*orders(400, 400, 400)), reply(content="done")], spend_policy(1000))
+
+    final = h.start()
+
+    assert [r.get("error") for r in tool_results(final)] == [None, None, "spend_cap_exceeded"]
+    assert (h.runs["create_work_order"], final["spend"], final["halted"]) == (2, 800, None)
+
+
+def test_spend_carries_across_messages_and_a_refusal_does_not_halt_the_run(conn, run_id):
+    def order(call_id, unit):
+        return reply(tool_call(call_id, "create_work_order", cost=400, unit=unit))
+
+    script = [order("a", "1"), order("b", "2"), order("c", "3"), reply(tool_call("d", "check_vendor_availability")), reply(content="done")]
+    h = Harness(conn, run_id, script, spend_policy(1000))
+
+    final = h.start()
+
+    assert [r.get("error") for r in tool_results(final)] == [None, None, "spend_cap_exceeded", None]
+    assert (final["spend"], h.runs["create_work_order"], h.runs["check_vendor_availability"]) == (800, 2, 1)
+    assert final["halted"] is None  # the model can still do cheaper things
+
+
+def test_a_refused_call_does_not_add_to_spend(conn, run_id):
+    h = Harness(conn, run_id, [reply(*orders(900)), reply(content="done")], spend_policy(500))
+    final = h.start()
+    assert (tool_results(final)[0]["error"], final["spend"], h.runs["create_work_order"]) == ("spend_cap_exceeded", 0, 0)
+
+
+def test_a_denied_approval_does_not_add_to_spend(conn, run_id):
+    h = Harness(conn, run_id, [reply(*orders(900)), reply(content="done")], spend_policy(2000))
+    h.start()
+    done = h.resume({"approved": False, "by": "alice"})
+    assert (done["spend"], h.runs["create_work_order"]) == (0, 0)
+
+
+def test_an_approved_order_counts_and_resuming_does_not_count_it_twice(conn, run_id):
+    h = Harness(conn, run_id, [reply(*orders(900, 900)), reply(content="done")], spend_policy(1500))
+    h.start()
+    done = h.resume({"approved": True, "by": "alice"})  # the first order; the second is over the cap
+
+    assert [r.get("error") for r in tool_results(done)] == [None, "spend_cap_exceeded"]
+    assert (done["spend"], h.runs["create_work_order"]) == (900, 1)
+
+
+def test_spend_without_a_cap_is_still_tracked(conn, run_id):
+    h = Harness(conn, run_id, [reply(*orders(100, 200)), reply(content="done")])
+    assert h.start()["spend"] == 300
+
+
+def test_a_tool_that_is_not_implemented_adds_nothing(conn, run_id):
+    h = Harness(conn, run_id, [reply(*orders(100)), reply(content="done")], spend_policy(1000), tool_names=("drop_database",))
+    final = h.start()
+    assert (tool_results(final)[0]["error"], final["spend"]) == ("tool_unavailable", 0)

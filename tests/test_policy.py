@@ -18,6 +18,7 @@ from portcullis.policy import (
     decide,
     definition_hash,
     fingerprint,
+    spend_amount,
 )
 
 PIN = "a" * 64
@@ -406,3 +407,74 @@ def test_a_definition_hash_ignores_key_order_and_changes_with_any_field():
     assert re.fullmatch(r"[0-9a-f]{64}", definition_hash(base))
     for field, value in (("description", "d "), ("name", "u"), ("schema", {"a": "int", "b": "int"})):
         assert definition_hash(base | {field: value}) != definition_hash(base)
+
+
+# --- cumulative spend cap ---
+
+
+def capped(max_spend) -> Policy:
+    budget = BUDGET.model_copy(update={"max_spend": max_spend})
+    tools = {
+        "create_work_order": ToolRule(risk=Risk.WRITE, approve_above=Threshold(arg="cost", limit=500)),
+        "check_vendor": ToolRule(risk=Risk.READ),
+    }
+    return Policy(tenants={"acme": TenantPolicy(budget=budget, tools=tools)})
+
+
+def order_decision(cost, spent, cap=1000, tool="create_work_order"):
+    return decide(capped(cap), call(tool, args={"cost": cost}), RunState(spend=spent))
+
+
+def test_without_a_cap_spend_is_not_limited():
+    assert BUDGET.max_spend is None
+    assert check(call("create_work_order", args={"cost": 499}), RunState(spend=10**9)).verdict is Verdict.ALLOW
+
+
+def test_a_call_that_stays_within_the_cap_is_allowed_and_one_that_reaches_it_exactly_too():
+    assert order_decision(300, spent=600).verdict is Verdict.ALLOW
+    assert order_decision(400, spent=600).verdict is Verdict.ALLOW  # exactly at the cap
+
+
+def test_a_call_that_would_pass_the_cap_is_denied_with_its_own_rule():
+    decision = order_decision(401, spent=600)
+    assert (decision.verdict, decision.rule) == (Verdict.DENY, "spend_cap_exceeded")
+
+
+def test_the_cap_beats_the_approval_threshold_so_a_human_cannot_exceed_it():
+    # 900 is above the 500 approval line, which would normally ask; over the cap it is denied instead.
+    assert order_decision(900, spent=500).rule == "spend_cap_exceeded"
+    assert order_decision(900, spent=0).rule == "approval_required"  # within the cap it still asks
+
+
+def test_a_cap_of_zero_allows_no_spend_but_still_allows_free_calls():
+    assert order_decision(1, spent=0, cap=0).rule == "spend_cap_exceeded"
+    assert order_decision(0, spent=0, cap=0).verdict is Verdict.ALLOW
+
+
+def test_the_cap_only_counts_tools_that_declare_an_amount():
+    assert order_decision(0, spent=999_999, tool="check_vendor").verdict is Verdict.ALLOW
+
+
+def test_an_invalid_amount_is_still_denied_as_invalid_not_as_over_the_cap():
+    assert decide(capped(1000), call("create_work_order", args={"cost": "900"}), RunState()).rule == "invalid_amount"
+
+
+@pytest.mark.parametrize("cap", [-1, math.nan, math.inf])
+def test_a_cap_must_be_a_finite_non_negative_number(cap):
+    with pytest.raises(ValidationError):
+        Budget(**{**BUDGET.model_dump(), "max_spend": cap})
+
+
+@pytest.mark.parametrize("spend", [-1, math.nan, math.inf])
+def test_spend_in_the_run_state_must_be_finite_and_non_negative(spend):
+    with pytest.raises(ValidationError):
+        RunState(spend=spend)
+
+
+def test_spend_amount_is_what_a_call_would_spend_and_zero_when_there_is_nothing_to_count():
+    pol = capped(1000)
+    assert spend_amount(pol, call("create_work_order", args={"cost": 250})) == 250
+    assert spend_amount(pol, call("create_work_order", args={"cost": "250"})) == 0  # invalid: never executed
+    assert spend_amount(pol, call("check_vendor")) == 0
+    assert spend_amount(pol, call("nope")) == 0
+    assert spend_amount(pol, call("create_work_order", tenant="nobody", args={"cost": 5})) == 0
