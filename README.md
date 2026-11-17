@@ -6,7 +6,7 @@
 
 Portcullis sits in front of an agent's tools and decides, with plain deterministic rules, what the agent is allowed to do. It can allow a call, block it, or pause it until a human approves. Every decision is written to a tamper-evident audit log.
 
-> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The server, dashboard and CLI are not. A feature is marked as built only when it has tests behind it; everything else is design.
+> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). The server and dashboard are not. A feature is marked as built only when it has tests behind it; everything else is design.
 
 ---
 
@@ -31,7 +31,7 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 |---|---|---|
 | Tool allowlists and risk levels | Per-tenant rules; each tool is `read`, `write` or `irreversible` | Built (policy engine) |
 | Human approval | Irreversible actions and spend above a threshold wait for an explicit approve or deny | Built in the LangGraph agent loop (pauses with `interrupt`, only a named explicit approval counts, the approver is recorded in state and never shown to the model); approval UI planned |
-| Tamper-evident audit log | Hash-chained records of every decision, who approved or denied what, and what ran | Built (one chain per run in Postgres, wired into the agent loop); no viewer yet |
+| Tamper-evident audit log | Hash-chained records of every decision, who approved or denied what, and what ran | Built (one chain per run in Postgres, wired into the agent loop); read and verify with `agentctl`; no dashboard yet |
 | Budgets and loop detection | Limits on steps, tokens and time, enforced by the runtime | Built in the LangGraph agent loop; a breach halts the run |
 | Idempotency keys | A crash and resume does not repeat a side effect | Built (Postgres ledger), wired into the LangGraph agent loop |
 | Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Hash check built; reading MCP definitions planned |
@@ -68,7 +68,7 @@ The same policy engine is reached through several entry points, so the rules are
 
 1. **Python library**: a guarded LangGraph agent loop where every tool call goes through the policy, approval and ledger (first version built; see `src/portcullis/agent.py`).
 2. **Server**: FastAPI policy engine with a Postgres audit log.
-3. **CLI** (`agentctl`): inspect runs, approve actions, verify the audit chain.
+3. **CLI** (`agentctl`, first version built, see below): verify and read an audit chain, dry-run a policy. Approving actions from the CLI is not built.
 4. **Skill**: a portable `SKILL.md` folder for coding agents that support the open skill format.
 5. **Claude Code plugin** (first version built, see below): a `PreToolUse` hook checks each tool call against the policy and answers deny or ask. It fails closed, so an error blocks the call instead of letting it through.
 6. **Dashboard**: a small Next.js app with three pages: approvals, audit log, eval report.
@@ -108,6 +108,21 @@ claude --plugin-dir ./plugin
 Protect the policy itself. The example denies file tools from writing `.portcullis/` and the hook, but the `Bash` tool can edit any file, so the policy cannot fully protect itself. Make the policy file read-only or owned by another user, which is the real control. For the same reason `Grep` and `Glob` can still surface secrets by searching a directory; keep secrets out of the project folder. Other settings: `PORTCULLIS_POLICY` (policy path) and `PORTCULLIS_TENANT` (default `claude-code`).
 
 Checked with a real Claude Code session on Windows: a read of a normal file went through, a read of a file named `.env` was refused with the reason above, and both decisions appeared in the audit chain.
+
+## agentctl
+
+A small read-only command line for the audit log and the policy (`uv run agentctl --help`).
+
+```bash
+uv run --env-file .env agentctl verify RUN_ID --rows 12 --head <hash>   # is the chain intact?
+uv run --env-file .env agentctl show RUN_ID                             # one JSON object per row, then the chain status
+uv run agentctl check plugin/policy.example.json --tenant claude-code --tool Read --args '{"file_path": ".env"}'
+```
+
+- **verify** exits 0 if the chain is intact and 1 if a row was changed, removed from the middle or reordered. A chain that lost its last rows is still self-consistent, so pass `--rows` and `--head` from a copy you kept elsewhere. A run with no rows fails unless you pass `--rows 0`.
+- **show** prints every row, then the chain status. Control characters in logged values are escaped, so a logged value cannot inject terminal escapes.
+- **check** runs one call through a policy file and prints `allow`, `deny` or `ask` with the rule. Exit codes are 0, 1 and 3. It needs no database and starts every call with a fresh state, so budgets and loop limits are not exercised. Put arguments in a file with `--args @args.json` if shell quoting gets in the way.
+- Exit 2 means the command itself failed (bad input, no database), not that the log is bad. The database comes only from `PORTCULLIS_DATABASE_URL`, over a read-only connection, so the tool cannot change the log it inspects. Errors never print the URL.
 
 ## Research question
 
@@ -181,7 +196,7 @@ uv run --env-file .env python -m portcullis.demo --scenario expensive  # one of 
 
 The container listens on `127.0.0.1:5433` only. Without `.env`, the Postgres tests are skipped. The test setup refuses to run against any database whose name does not start with `portcullis`.
 
-The test suite is the only thing to run so far. This section will grow with the code.
+Run `uv run agentctl --help` for the CLI. The test suite and the demo are the main things to run so far. This section will grow with the code.
 
 ## Data and licensing notes
 
