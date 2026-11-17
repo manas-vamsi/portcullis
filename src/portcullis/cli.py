@@ -1,0 +1,155 @@
+"""agentctl: check an audit chain, read it, and dry-run a policy.
+
+  agentctl verify RUN_ID [--rows N] [--head HASH]   exit 0 intact, 1 broken or mismatch
+  agentctl show RUN_ID                              one JSON object per row, then the chain status
+  agentctl check POLICY --tenant T --tool NAME      exit 0 allow, 1 deny, 3 ask (no database needed)
+                [--args JSON | --args @file]
+
+Exit 2 means the command itself failed (bad input, no database), not that anything is wrong with the log.
+
+verify checks that the chain is self-consistent. A chain that lost its last rows is still
+self-consistent, so pass --rows or --head from a copy you kept elsewhere to catch that.
+
+The database is reached through PORTCULLIS_DATABASE_URL only (a URL on the command line would sit in
+shell history) over a read-only connection, so this tool cannot change the log it inspects.
+"""
+
+import argparse
+import json
+import os
+import sys
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+import psycopg
+
+from portcullis.audit import GENESIS, events, require_project_database, verify
+from portcullis.hook import HookError, load_policy
+from portcullis.policy import RunState, ToolCall, Verdict, decide
+
+EXIT_OK, EXIT_FAIL, EXIT_ERROR, EXIT_ASK = 0, 1, 2, 3
+READ_ONLY = "-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=5000"
+
+
+class CliError(Exception):
+    """The command could not run. Reported without a traceback."""
+
+
+def connect(env: Mapping[str, str]) -> psycopg.Connection:
+    url = env.get("PORTCULLIS_DATABASE_URL")
+    if not url:
+        raise CliError("set PORTCULLIS_DATABASE_URL to the audit database")
+    try:
+        require_project_database(url)
+        return psycopg.connect(url, autocommit=True, connect_timeout=5, options=READ_ONLY)
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    except psycopg.Error as exc:  # never echo the error: it can contain the URL
+        raise CliError(f"cannot connect to the database ({type(exc).__name__})") from exc
+
+
+def _verify(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    with connect(env) as conn:
+        result = verify(conn, args.run_id)
+    if not result.ok:
+        print(f"BROKEN: {result.problem}")
+        return EXIT_FAIL
+    if result.rows == 0 and args.rows != 0:
+        print("FAILED: no rows for this run (an empty log looks the same as a missing one; pass --rows 0 to expect that)")
+        return EXIT_FAIL
+    if args.rows is not None and result.rows != args.rows:
+        print(f"MISMATCH: expected {args.rows} rows, found {result.rows} rows")
+        return EXIT_FAIL
+    if args.head is not None and result.head != args.head:
+        print(f"MISMATCH: expected head {args.head}, found {result.head}")
+        return EXIT_FAIL
+    print(f"OK: {result.rows} rows, head {result.head}")
+    return EXIT_OK
+
+
+def _payload(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except ValueError:  # a tampered row may not be JSON; show it as it is
+        return text
+
+
+def _show(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    with connect(env) as conn:
+        rows = events(conn, args.run_id)
+        result = verify(conn, args.run_id)
+    for row in rows:
+        # json.dumps escapes control characters, so a logged value cannot inject terminal escapes
+        print(json.dumps({**row, "payload": _payload(row["payload"])}))
+    if result.ok:
+        print(f"chain: OK, {result.rows} rows, head {result.head if result.rows else GENESIS}")
+        return EXIT_OK
+    print(f"chain: BROKEN: {result.problem}")
+    return EXIT_FAIL
+
+
+def _read_args(text: str) -> dict[str, Any]:
+    try:
+        raw = Path(text[1:]).read_text(encoding="utf-8") if text.startswith("@") else text
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CliError(f"cannot read the arguments file ({type(exc).__name__})") from exc
+    except ValueError as exc:
+        raise CliError("--args is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise CliError("--args must be a JSON object")
+    return value
+
+
+def _check(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    try:
+        policy = load_policy(Path(args.policy))
+    except HookError as exc:
+        raise CliError(str(exc)) from exc
+    call = ToolCall(tenant_id=args.tenant, tool=args.tool, args=_read_args(args.args))
+    decision = decide(policy, call, RunState())  # a fresh state: budgets and loop limits are not exercised
+    print(f"{decision.verdict.value} [{decision.rule}]: {decision.reason}")
+    return {Verdict.ALLOW: EXIT_OK, Verdict.DENY: EXIT_FAIL, Verdict.ASK: EXIT_ASK}[decision.verdict]
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="agentctl", description="Inspect portcullis audit logs and policies.")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    verify_cmd = commands.add_parser("verify", help="check a run's hash chain")
+    verify_cmd.add_argument("run_id")
+    verify_cmd.add_argument("--rows", type=int, help="expected number of rows, from a copy kept elsewhere")
+    verify_cmd.add_argument("--head", help="expected hash of the last row, from a copy kept elsewhere")
+    verify_cmd.set_defaults(run=_verify)
+
+    show_cmd = commands.add_parser("show", help="print a run's rows, then its chain status")
+    show_cmd.add_argument("run_id")
+    show_cmd.set_defaults(run=_show)
+
+    check_cmd = commands.add_parser("check", help="ask a policy what it would do with one call")
+    check_cmd.add_argument("policy", help="path to a policy JSON file")
+    check_cmd.add_argument("--tenant", required=True)
+    check_cmd.add_argument("--tool", required=True)
+    check_cmd.add_argument("--args", default="{}", help="a JSON object, or @path to read one from a file")
+    check_cmd.set_defaults(run=_check)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
+    environment = os.environ if env is None else env
+    try:
+        args = _parser().parse_args(argv)
+        return args.run(args, environment)
+    except SystemExit as exc:  # argparse exits on bad usage (2) and on --help (0)
+        return int(exc.code or 0)
+    except CliError as exc:
+        print(f"agentctl: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except psycopg.Error as exc:
+        print(f"agentctl: database error ({type(exc).__name__})", file=sys.stderr)
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
