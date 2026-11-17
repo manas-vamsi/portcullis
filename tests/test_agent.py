@@ -324,6 +324,9 @@ def test_the_call_id_does_not_come_from_the_model(conn, run_id):
         {"id": "t1", "name": "check_vendor_availability", "args": {"n": 10**4400}},
         {"id": "t1", "name": "check_vendor_availability", "args": {"n": [1, [10**25]]}},
         {"id": "t1", "name": "check_vendor_availability", "args": {"x": DEEPLY_NESTED}},
+        {"id": "t1", "name": "check_vendor_availability", "args": {"x": _nested(300)}},
+        {"id": "t1", "name": "check_vendor_availability", "args": {"x": object()}},
+        {"id": "t1", "name": "check_vendor_availability", "args": {"x": (1, 2)}},
     ],
     ids=[
         "no_args",
@@ -336,6 +339,9 @@ def test_the_call_id_does_not_come_from_the_model(conn, run_id):
         "beyond_4300_digit_int",
         "beyond_64_bit_int_in_a_list",
         "deep_nesting",
+        "nesting_over_the_checkpoint_limit",
+        "not_json_data",
+        "tuple_not_json",
     ],
 )
 def test_malformed_tool_calls_from_the_model_are_refused_not_crashes(conn, run_id, bad_call):
@@ -347,6 +353,23 @@ def test_malformed_tool_calls_from_the_model_are_refused_not_crashes(conn, run_i
     assert tool_results(final)[0]["error"] == "invalid_tool_call"
     assert final["messages"][-1]["content"] == "ok"
     assert final["steps"] == 1  # a malformed call still uses up a step
+
+
+def test_ordinary_json_arguments_are_accepted(conn, run_id):
+    args = {"unit": 4, "notes": ["leak", None, True, 2.5], "contact": {"name": "A", "phones": [{"n": "1"}]}}
+    h = Harness(conn, run_id, [reply(tool_call("t1", "check_vendor_availability", **args)), reply(content="ok")])
+
+    final = h.start()
+
+    assert h.runs["check_vendor_availability"] == 1
+    assert tool_results(final) == [{"result": {"tool": "check_vendor_availability"}}]
+
+
+def test_a_reply_that_omits_the_token_count_is_an_error_not_a_free_pass(conn, run_id):
+    h = Harness(conn, run_id, [{"content": "hi"}])
+
+    with pytest.raises(ValueError, match="tokens"):
+        h.start()
 
 
 def test_tool_calls_that_are_not_a_list_are_refused_not_silently_dropped(conn, run_id):

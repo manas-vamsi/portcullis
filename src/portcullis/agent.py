@@ -17,9 +17,9 @@ to the model, which sees only a rule code for a refusal. Allowed and approved ca
 the idempotency ledger. Its call id is the message and call position in the checkpointed history
 (m3-c0), never the model's own tool-call id, because models can reuse ids.
 
-Only validated tool calls are stored in the checkpointed state. Arguments that would crash the
-checkpoint write or the loop check (integers beyond 64 bits, mixed-type keys, very deep nesting)
-make the call invalid instead of bricking the run on every resume.
+Only validated tool calls are stored in the checkpointed state, and their arguments must be
+plain JSON data: string keys, integers within 64 bits, at most 32 levels deep. Anything else
+(which could crash the checkpoint write or the loop check) makes the call invalid instead.
 
 When the human answer arrives, LangGraph re-runs the interrupted node from the top. Decisions
 are computed from the state at the start of the node, so the re-run decides identically, and
@@ -48,8 +48,11 @@ from portcullis.policy import Decision, Policy, RunState, ToolCall, Verdict, dec
 
 Tool = Callable[[dict[str, Any], str], Any]  # (args, idempotency key) -> JSON-compatible result
 HALTING_RULES = frozenset({"budget_exceeded", "loop_detected", "unknown_tenant"})
-INVALID_TOOL = "<invalid-tool-call>"  # stands in for a malformed call so it still counts against the budget
+# Stands in for a malformed call so it still counts against the budget. All malformed calls share
+# one fingerprint, so max_identical_calls of them in a run is treated as a loop.
+INVALID_TOOL = "<invalid-tool-call>"
 MAX_INT, MIN_INT = 2**64 - 1, -(2**63)  # LangGraph's checkpoint serializer fails outside this range
+MAX_DEPTH = 32  # ...and on data nested about 250 levels deep; tool arguments never need more than this
 
 
 class AgentState(TypedDict):
@@ -67,16 +70,25 @@ class AgentState(TypedDict):
 Node = Callable[[AgentState], dict[str, Any]]
 
 
-def _check_ints(value: Any) -> None:
-    if isinstance(value, int) and not MIN_INT <= value <= MAX_INT:
-        raise ValueError("integer outside the 64-bit range")
-    if isinstance(value, dict):
-        for key, item in value.items():
-            _check_ints(key)
-            _check_ints(item)
-    elif isinstance(value, (list, tuple)):
+def _check_json(value: Any, depth: int = 0) -> None:
+    """Only plain JSON data may enter the checkpointed state."""
+    if depth > MAX_DEPTH:
+        raise ValueError("nested too deeply")
+    if value is None or isinstance(value, (bool, str, float)):
+        return
+    if isinstance(value, int):
+        if not MIN_INT <= value <= MAX_INT:
+            raise ValueError("integer outside the 64-bit range")
+    elif isinstance(value, list):
         for item in value:
-            _check_ints(item)
+            _check_json(item, depth + 1)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("object keys must be strings")
+            _check_json(item, depth + 1)
+    else:
+        raise ValueError(f"{type(value).__name__} is not JSON data")
 
 
 class ModelToolCall(BaseModel):
@@ -91,11 +103,7 @@ class ModelToolCall(BaseModel):
     @field_validator("args")
     @classmethod
     def _args_must_be_safe_to_store(cls, args: dict[str, Any]) -> dict[str, Any]:
-        try:
-            json.dumps(args, sort_keys=True, default=str)  # mixed-type keys, cycles, 4300+ digit ints
-            _check_ints(args)
-        except (TypeError, ValueError, RecursionError) as exc:
-            raise ValueError("arguments cannot be stored safely") from exc
+        _check_json(args)  # a ValueError here becomes a ValidationError, so the call is invalid
         return args
 
 
@@ -199,7 +207,7 @@ def _answer(
 
 
 def _tokens(reply: dict[str, Any]) -> int:
-    tokens = reply.get("tokens", 0)
+    tokens = reply.get("tokens")  # required: a missing count would silently switch the token budget off
     if isinstance(tokens, bool) or not isinstance(tokens, int) or not 0 <= tokens <= MAX_INT:
         raise ValueError("llm reply 'tokens' must be an int from 0 to 2**64-1, taken from the adapter's usage data")
     return tokens

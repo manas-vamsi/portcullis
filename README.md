@@ -104,7 +104,8 @@ Teams that run agents with real side effects and need control and evidence: mult
 - Delivery is at-least-once, not exactly-once. If the process dies after a tool call but before the ledger records it, the call is retried with the same idempotency key. The outside service must deduplicate by that key; one that ignores keys can see one duplicate. A test pins this.
 - A call that keeps failing is retried on every resume. There is no per-call retry cap yet.
 - The time budget is checked when each tool step starts, so one slow step can overshoot it, and tool time spent before an approval pause is not counted after the pause.
-- LangGraph's checkpoint serializer rejects integers beyond 64 bits, so the agent loop treats a tool call carrying one as invalid rather than letting it break the run.
+- LangGraph's checkpoint serializer rejects integers beyond 64 bits and very deep nesting, so the agent loop accepts only plain JSON tool arguments (string keys, 64-bit integers, at most 32 levels deep) and treats anything else as an invalid call.
+- All malformed tool calls share one loop fingerprint, so a run with `max_identical_calls` of them is halted as a loop.
 - The ledger call id is the message and call position in the checkpointed history, not the model's tool-call id, so a model that reuses ids cannot collide with the ledger.
 - Pinned tool definitions are not wired into the agent loop yet, so a pinned tool is always denied there.
 - The engine trusts its caller for the tenant and for the hash of the live tool definition. These must come from the runtime (authenticated identity, the real MCP definition), never from model output.
