@@ -6,7 +6,7 @@
 
 Portcullis sits in front of an agent's tools and decides, with plain deterministic rules, what the agent is allowed to do. It can allow a call, block it, or pause it until a human approves. Every decision is written to a tamper-evident audit log.
 
-> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. The server, dashboard, CLI and plugin policy are not. A feature is marked as built only when it has tests behind it; everything else is design.
+> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The server, dashboard and CLI are not. A feature is marked as built only when it has tests behind it; everything else is design.
 
 ---
 
@@ -70,7 +70,7 @@ The same policy engine is reached through several entry points, so the rules are
 2. **Server**: FastAPI policy engine with a Postgres audit log.
 3. **CLI** (`agentctl`): inspect runs, approve actions, verify the audit chain.
 4. **Skill**: a portable `SKILL.md` folder for coding agents that support the open skill format.
-5. **Claude Code plugin**: a `PreToolUse` hook sends each tool call to the server and returns allow, deny or ask. The hook is designed to fail closed, so an error blocks the call instead of letting it through.
+5. **Claude Code plugin** (first version built, see below): a `PreToolUse` hook checks each tool call against the policy and answers deny or ask. It fails closed, so an error blocks the call instead of letting it through.
 6. **Dashboard**: a small Next.js app with three pages: approvals, audit log, eval report.
 
 ## Demo domain
@@ -84,6 +84,30 @@ A property-management maintenance triage agent, built on **synthetic data only**
 - Emergency words such as "gas leak" or "on fire" skip the model and escalate to a human through plain keyword rules. The list is short and not exhaustive.
 
 Five scenarios: `routine`, `expensive` (approved), `expensive_denied`, `emergency`, and `attack` (a forbidden tool, then a spend sent as a string to dodge the limit). Each prints its transcript and verifies its audit chain. See "Getting started" to run it.
+
+## Claude Code plugin
+
+The plugin in `plugin/` runs a `PreToolUse` hook before every tool call (`Bash`, `Edit`, `Read`, MCP tools and so on). The policy can look inside arguments with `deny_if` and `ask_if` regex rules.
+
+- **Allowed:** the hook prints nothing, so Claude Code's own permission prompts still apply. Portcullis only narrows what is permitted.
+- **Denied:** the call is blocked with exit code 2 and Claude is told the rule that fired, for example `Portcullis [forbidden_argument]: argument 'file_path' matches a forbidden pattern`. Exit 2 is used because a deny sent as JSON would turn into "proceed" if the output were ever truncated or polluted.
+- **Ask:** Claude Code asks the user.
+- **Any error blocks the call.** Claude Code treats exit code 1 and a hook timeout as non-blocking, and a Python import failure exits 1. So a thin standard-library launcher turns every failure into exit 2, catches errors of any kind, and runs a watchdog that blocks a hung hook before Claude Code's own timeout would let the call through. The hook is also registered with `onFailure: "block"` (Claude Code 2.1.295 or newer), so even a hook that cannot start blocks the call; I checked that with a hook command that does not exist. Tools that are not in the policy are denied, and a rule can mark an argument `required` so a misspelled argument name denies the call instead of silently switching the rule off.
+- **Optional audit:** with `PORTCULLIS_DATABASE_URL` set, every decision is written to the hash-chained log before the answer is returned, and a failed write blocks the call. The log holds a hash of the request, not the command or path.
+
+Setup, from a checkout with the package installed (`uv sync`):
+
+```bash
+mkdir -p .portcullis && cp plugin/policy.example.json .portcullis/policy.json
+export PORTCULLIS_PYTHON="$(pwd)/.venv/Scripts/python.exe"   # the Python that has portcullis (.venv/bin/python on Linux and macOS)
+claude --plugin-dir ./plugin
+```
+
+`plugin/policy.example.json` blocks reading or writing `.env` files and keys, writing the policy, the hook and Claude Code's settings, `rm -r` on `/` or `~`, piping a download into a shell and force pushes. It asks before a plain `git push`, an edit to `.git` or workflow files, or a shell command that names the policy or settings. It is a starting point, not a complete defence: write your own, and add rules for the MCP tools you use, because anything not listed is denied.
+
+Protect the policy itself. The example denies file tools from writing `.portcullis/` and the hook, but the `Bash` tool can edit any file, so the policy cannot fully protect itself. Make the policy file read-only or owned by another user, which is the real control. For the same reason `Grep` and `Glob` can still surface secrets by searching a directory; keep secrets out of the project folder. Other settings: `PORTCULLIS_POLICY` (policy path) and `PORTCULLIS_TENANT` (default `claude-code`).
+
+Checked with a real Claude Code session on Windows: a read of a normal file went through, a read of a file named `.env` was refused with the reason above, and both decisions appeared in the audit chain.
 
 ## Research question
 
@@ -107,6 +131,9 @@ Teams that run agents with real side effects and need control and evidence: mult
 - Loop detection compares the tool name and arguments. A model can vary the arguments to avoid it. The step budget is the hard stop.
 - Delivery is at-least-once, not exactly-once. If the process dies after a tool call but before the ledger records it, the call is retried with the same idempotency key. The outside service must deduplicate by that key; one that ignores keys can see one duplicate. A test pins this.
 - The audit log is tamper-evident, not tamper-proof. Editing or deleting a row inside a run's chain is detected. Deleting the last rows or a whole run is not, unless you keep the head hash somewhere else. Someone with database write access can rewrite a whole chain. It stores a hash of each request, not the arguments.
+- The Claude Code hook is stateless: each call is a separate process, so budgets and loop detection do not apply to it yet. An `ask` is answered inside Claude Code, which does not tell the hook what the user chose, so approvals are not recorded there.
+- The hook adds delay to every tool call. Measured on one Windows laptop (i7-1355U), a call takes about 0.5 to 0.8 seconds, most of it importing Pydantic; importing the database driver is skipped unless auditing is on. A faster implementation (the plan mentions a Rust CLI) is not built, and these numbers are from one machine.
+- Argument rules are regexes written by the policy author and run on text the model controls. Python's `re` has no timeout, so avoid nested quantifiers. Arguments over 10,000 characters are denied instead of inspected. A pattern list is only as good as its author.
 - An empty audit chain and a missing one look the same to `verify()`, so check the row count or head hash against what you expect. Reusing an event id for different content raises an error instead of being deduplicated.
 - A call that keeps failing is retried on every resume. There is no per-call retry cap yet.
 - The time budget is checked when each tool step starts, so one slow step can overshoot it, and tool time spent before an approval pause is not counted after the pause.
