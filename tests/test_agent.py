@@ -9,6 +9,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from portcullis.agent import build_agent, initial_state
+from portcullis.audit import AuditConflict, verify
+from portcullis.idempotency import idempotency_key
 from portcullis.llm import FakeLLM
 from portcullis.policy import Budget, Policy, Risk, TenantPolicy, Threshold, ToolRule
 
@@ -80,6 +82,11 @@ class Harness:
 
     def resume(self, answer: object) -> dict:
         return self.agent.invoke(Command(resume=answer), self.config)
+
+
+def audit_events(conn, run_id: str) -> list[tuple[str, dict]]:
+    rows = conn.execute("SELECT event, payload FROM audit_log WHERE run_id = %s ORDER BY idx", (run_id,)).fetchall()
+    return [(event, json.loads(payload)) for event, payload in rows]
 
 
 def tool_results(state: dict) -> list[dict]:
@@ -391,23 +398,130 @@ def test_a_bad_token_count_from_the_adapter_is_a_clear_error(conn, run_id, bad_t
         h.start()
 
 
-def test_two_tenants_sharing_a_run_id_do_not_see_each_others_results(conn, run_id):
+def test_a_second_tenant_reusing_a_run_id_is_stopped_before_its_tool_runs(conn, run_id):
+    # The ledger key includes the tenant, and the audit log refuses the clash outright: run ids must be unique.
     script = [reply(tool_call("t1", "check_vendor_availability", trade="plumber")), reply(content="done")]
     acme, globex = Harness(conn, run_id, script), Harness(conn, run_id, script)
 
     acme.start(tenant="acme")
-    globex.start(tenant="globex")
+    with pytest.raises(AuditConflict):
+        globex.start(tenant="globex")
 
     assert acme.runs["check_vendor_availability"] == 1
-    assert globex.runs["check_vendor_availability"] == 1  # not served acme's stored result
+    assert globex.runs["check_vendor_availability"] == 0  # not served acme's stored result either
 
 
-def test_a_tool_the_policy_allows_but_nobody_implemented_is_refused(conn, run_id):
+def test_an_approved_call_leaves_decision_approval_and_execution_in_the_audit_log(conn, run_id):
+    h = Harness(conn, run_id, [reply(tool_call("t1", "create_work_order", cost=900)), reply(content="done")])
+    h.start()
+    h.resume({"approved": True, "by": "alice"})
+
+    events = audit_events(conn, run_id)
+
+    # The node re-ran when the approval arrived, but its decision was recorded only once.
+    assert [name for name, _ in events] == ["decision", "approval", "executed"]
+    decision, approval, executed = (payload for _, payload in events)
+    assert (decision["verdict"], decision["rule"], decision["tool"]) == ("ask", "approval_required", "create_work_order")
+    assert (approval["approved"], approval["approved_by"]) == (True, "alice")
+    assert executed["idempotency_key"] == idempotency_key(run_id, json.dumps(["acme", "m1-c0"]))
+    assert verify(conn, run_id).ok
+
+
+def test_a_denied_approval_is_logged_with_who_denied_it_and_nothing_executes(conn, run_id):
+    h = Harness(conn, run_id, [reply(tool_call("t1", "create_work_order", cost=900)), reply(content="ok")])
+    h.start()
+    h.resume({"approved": False, "by": "bob"})
+
+    events = audit_events(conn, run_id)
+
+    assert [name for name, _ in events] == ["decision", "approval"]
+    assert (events[1][1]["approved"], events[1][1]["approved_by"]) == (False, "bob")
+
+
+def test_a_refused_call_is_logged_with_its_rule(conn, run_id):
+    h = Harness(conn, run_id, [reply(tool_call("t1", "drop_database")), reply(content="ok")])
+    h.start()
+
+    [(name, payload)] = audit_events(conn, run_id)
+
+    assert (name, payload["verdict"], payload["rule"]) == ("decision", "deny", "tool_not_allowed")
+
+
+def test_calls_after_a_halt_are_logged_too(conn, run_id):
+    calls = [tool_call(f"t{i}", "check_vendor_availability", n=i) for i in range(3)]
+    h = Harness(conn, run_id, [reply(*calls)], make_policy(max_steps=1))
+    h.start()
+
+    events = audit_events(conn, run_id)
+
+    assert [(n, p.get("rule")) for n, p in events] == [
+        ("decision", "allowed"),
+        ("executed", None),
+        ("decision", "budget_exceeded"),
+        ("decision", "run_halted"),
+    ]
+
+
+def test_the_audit_log_holds_a_hash_of_the_request_not_the_arguments(conn, run_id):
+    h = Harness(conn, run_id, [reply(tool_call("t1", "check_vendor_availability", note="SECRET-VALUE")), reply(content="ok")])
+    h.start()
+
+    stored = " ".join(payload for (payload,) in conn.execute("SELECT payload FROM audit_log WHERE run_id = %s", (run_id,)))
+
+    assert "SECRET-VALUE" not in stored
+    assert "request_sha256" in stored
+
+
+def test_if_the_audit_write_fails_the_tool_does_not_run(conn, run_id, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("audit database down")
+
+    monkeypatch.setattr("portcullis.audit.append", broken)
+    h = Harness(conn, run_id, [reply(tool_call("t1", "check_vendor_availability")), reply(content="ok")])
+
+    with pytest.raises(RuntimeError, match="audit"):
+        h.start()
+
+    assert h.runs["check_vendor_availability"] == 0
+
+
+def test_a_tool_the_policy_allows_but_nobody_implemented_is_refused_and_logged(conn, run_id):
     h = Harness(conn, run_id, [reply(tool_call("t1", "notify_tenant")), reply(content="ok")])
 
     final = h.start()
 
     assert tool_results(final)[0]["error"] == "tool_unavailable"
+    assert [(n, p.get("rule")) for n, p in audit_events(conn, run_id)] == [
+        ("decision", "allowed"),
+        ("refused", "tool_unavailable"),
+    ]
+
+
+def test_a_tool_that_raises_is_logged_as_failed_and_logged_as_executed_when_the_retry_works(conn, run_id):
+    h = Harness(
+        conn,
+        run_id,
+        [reply(tool_call("t1", "check_vendor_availability")), reply(content="done")],
+        fail_once=("check_vendor_availability",),
+    )
+
+    with pytest.raises(RuntimeError):
+        h.start()
+    assert [n for n, _ in audit_events(conn, run_id)] == ["decision", "failed"]
+    assert audit_events(conn, run_id)[1][1]["error"] == "RuntimeError"
+
+    h.agent.invoke(None, h.config)
+
+    assert [n for n, _ in audit_events(conn, run_id)] == ["decision", "failed", "executed"]
+    assert verify(conn, run_id).ok
+
+
+def test_an_absurdly_long_tool_name_is_an_invalid_call_not_a_giant_log_row(conn, run_id):
+    h = Harness(conn, run_id, [reply(tool_call("t1", "x" * 129)), reply(content="ok")])
+
+    final = h.start()
+
+    assert tool_results(final) == [{"error": "invalid_tool_call"}]
 
 
 def test_a_failing_tool_is_retried_with_the_same_key_when_the_run_resumes(conn, run_id):

@@ -17,6 +17,11 @@ to the model, which sees only a rule code for a refusal. Allowed and approved ca
 the idempotency ledger. Its call id is the message and call position in the checkpointed history
 (m3-c0), never the model's own tool-call id, because models can reuse ids.
 
+Every call is written to the hash-chained audit log (portcullis.audit): the decision before
+anything runs, so if the audit write fails the tool does not run, then any human answer, then
+the execution with its idempotency key. Event ids come from the call position, so the repeat
+when LangGraph re-runs an interrupted node is recorded once.
+
 Only validated tool calls are stored in the checkpointed state, and their arguments must be
 plain JSON data: string keys, integers within 64 bits, at most 32 levels deep. Anything else
 (which could crash the checkpoint write or the loop check) makes the call invalid instead.
@@ -42,7 +47,8 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from portcullis.idempotency import run_once
+from portcullis.audit import AuditTrail
+from portcullis.idempotency import idempotency_key, run_once
 from portcullis.llm import LLM
 from portcullis.policy import Decision, Policy, RunState, ToolCall, Verdict, decide, fingerprint
 
@@ -97,7 +103,7 @@ class ModelToolCall(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True)
 
     id: str = Field(min_length=1)
-    name: str
+    name: str = Field(max_length=128)  # the name is written to the audit log, so it must be bounded
     args: dict[str, Any]
 
     @field_validator("args")
@@ -149,8 +155,12 @@ def _refusal(call_id: str, rule: str) -> dict[str, Any]:
     return _tool_message(call_id, {"error": rule})
 
 
-def _approver(state: AgentState, call: ModelToolCall, position_id: str, decision: Decision) -> str | None:
-    """Pause until a human answers. Returns the approver's name only for an explicit, named approval."""
+def _approver(state: AgentState, call: ModelToolCall, position_id: str, decision: Decision) -> tuple[bool, str | None]:
+    """Pause until a human answers. Returns (approved, name).
+
+    Approved only for an explicit True from a named person. The name is returned for a denial too,
+    so the audit log shows who said no.
+    """
     answer = interrupt(
         {
             "tenant_id": state["tenant_id"],
@@ -163,19 +173,37 @@ def _approver(state: AgentState, call: ModelToolCall, position_id: str, decision
             "reason": decision.reason,
         }
     )
-    if isinstance(answer, dict) and answer.get("approved") is True:
-        name = answer.get("by")
-        if isinstance(name, str) and name.strip():
-            return name.strip()
-    return None
+    name = answer.get("by") if isinstance(answer, dict) else None
+    name = name.strip() if isinstance(name, str) and name.strip() else None
+    approved = isinstance(answer, dict) and answer.get("approved") is True and name is not None
+    return approved, name
+
+
+def _ledger_call_id(state: AgentState, position_id: str) -> str:
+    return json.dumps([state["tenant_id"], position_id])  # scoped by tenant
 
 
 def _execute(
     conn: psycopg.Connection, tool: Tool, state: AgentState, position_id: str, call: ModelToolCall
 ) -> dict[str, Any]:
-    ledger_call_id = json.dumps([state["tenant_id"], position_id])  # scoped by tenant
+    ledger_call_id = _ledger_call_id(state, position_id)
     result = run_once(conn, state["run_id"], ledger_call_id, call.name, call.args, lambda key: tool(call.args, key))
     return _tool_message(call.id, {"result": result})
+
+
+def _log_decision(trail: AuditTrail, position_id: str, name: str, args: dict[str, Any], decision: Decision) -> None:
+    trail.record(
+        f"{position_id}:decision",
+        "decision",
+        {
+            "call_id": position_id,
+            "tool": name,
+            "verdict": decision.verdict.value,
+            "rule": decision.rule,
+            "reason": decision.reason,
+            "request_sha256": fingerprint(name, args),  # a hash, not the arguments, which may be sensitive
+        },
+    )
 
 
 def _answer(
@@ -186,6 +214,7 @@ def _answer(
     decision: Decision,
     position_id: str,
     message_id: str,
+    trail: AuditTrail,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """The tool message for one call, plus the approval record if a human approved it."""
     if decision.rule in HALTING_RULES:
@@ -196,14 +225,35 @@ def _answer(
         return _refusal(message_id, decision.rule), None
     tool = tools.get(call.name)
     if tool is None:
+        trail.record(
+            f"{position_id}:refused",
+            "refused",
+            {"call_id": position_id, "tool": call.name, "rule": "tool_unavailable"},
+        )
         return _refusal(message_id, "tool_unavailable"), None
     approval = None
     if decision.verdict is Verdict.ASK:
-        approver = _approver(state, call, position_id, decision)
-        if approver is None:
+        approved, by = _approver(state, call, position_id, decision)
+        trail.record(
+            f"{position_id}:approval",
+            "approval",
+            {"call_id": position_id, "tool": call.name, "approved": approved, "approved_by": by},
+        )
+        if not approved:
             return _refusal(message_id, "approval_denied"), None
-        approval = {"call_id": position_id, "tool": call.name, "args": call.args, "approved_by": approver}
-    return _execute(conn, tool, state, position_id, call), approval
+        approval = {"call_id": position_id, "tool": call.name, "args": call.args, "approved_by": by}
+    try:
+        message = _execute(conn, tool, state, position_id, call)
+    except Exception as exc:
+        # The outcome is unknown, so the retry may run it again; the log shows both attempts.
+        trail.record(
+            f"{position_id}:failed", "failed", {"call_id": position_id, "tool": call.name, "error": type(exc).__name__}
+        )
+        raise
+    key = idempotency_key(state["run_id"], _ledger_call_id(state, position_id))
+    executed = {"call_id": position_id, "tool": call.name, "idempotency_key": key}
+    trail.record(f"{position_id}:executed", "executed", executed)
+    return message, approval
 
 
 def _tokens(reply: dict[str, Any]) -> int:
@@ -241,22 +291,26 @@ def make_tools_node(policy: Policy, tools: Mapping[str, Tool], conn: psycopg.Con
         position = len(state["messages"]) - 1
         messages, history, approvals = list(state["messages"]), list(state["history"]), list(state["approvals"])
         steps, halted = state["steps"], None
+        trail = AuditTrail(conn, state["run_id"], state["tenant_id"])
 
         for index, raw in enumerate(state["messages"][-1]["tool_calls"]):
-            message_id = _raw_id(raw, index)
-            if halted:
-                messages.append(_refusal(message_id, "run_halted"))
-                continue
+            message_id, position_id = _raw_id(raw, index), f"m{position}-c{index}"
             call = _parse(raw)
             name, args = (call.name, call.args) if call else (INVALID_TOOL, {})
+            if halted:
+                skipped = Decision(verdict=Verdict.DENY, rule="run_halted", reason="the run was halted earlier")
+                _log_decision(trail, position_id, name, args, skipped)
+                messages.append(_refusal(message_id, "run_halted"))
+                continue
             run_state = RunState(
                 steps=steps, tokens=state["tokens"], seconds=state["seconds"], history=tuple(history)
             )
             decision = decide(policy, ToolCall(tenant_id=state["tenant_id"], tool=name, args=args), run_state)
+            _log_decision(trail, position_id, name, args, decision)  # written before anything runs
             steps += 1
             history.append(fingerprint(name, args))
 
-            message, approval = _answer(state, conn, tools, call, decision, f"m{position}-c{index}", message_id)
+            message, approval = _answer(state, conn, tools, call, decision, position_id, message_id, trail)
             messages.append(message)
             if approval:
                 approvals.append(approval)
