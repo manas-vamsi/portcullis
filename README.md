@@ -6,7 +6,7 @@
 
 Portcullis sits in front of an agent's tools and decides, with plain deterministic rules, what the agent is allowed to do. It can allow a call, block it, or pause it until a human approves. Every decision is written to a tamper-evident audit log.
 
-> **Status: early development.** The deterministic policy engine (allow, deny or ask) is built and tested. The server, audit log, approval flow, dashboard and plugin policy are not. A feature is marked as built only when it has tests behind it; everything else is design.
+> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. The server, dashboard, CLI and plugin policy are not. A feature is marked as built only when it has tests behind it; everything else is design.
 
 ---
 
@@ -30,8 +30,8 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 | Capability | What it means | Status |
 |---|---|---|
 | Tool allowlists and risk levels | Per-tenant rules; each tool is `read`, `write` or `irreversible` | Built (policy engine) |
-| Human approval | Irreversible actions and spend above a threshold wait for an explicit approve or deny | Built in the LangGraph agent loop (pauses with `interrupt`, only a named explicit approval counts, the approver is recorded in state and never shown to the model); approval UI and the tamper-evident audit log planned |
-| Tamper-evident audit log | Hash-chained records of who approved what and when | Planned |
+| Human approval | Irreversible actions and spend above a threshold wait for an explicit approve or deny | Built in the LangGraph agent loop (pauses with `interrupt`, only a named explicit approval counts, the approver is recorded in state and never shown to the model); approval UI planned |
+| Tamper-evident audit log | Hash-chained records of every decision, who approved or denied what, and what ran | Built (one chain per run in Postgres, wired into the agent loop); no viewer yet |
 | Budgets and loop detection | Limits on steps, tokens and time, enforced by the runtime | Built in the LangGraph agent loop; a breach halts the run |
 | Idempotency keys | A crash and resume does not repeat a side effect | Built (Postgres ledger), wired into the LangGraph agent loop |
 | Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Hash check built; reading MCP definitions planned |
@@ -104,6 +104,8 @@ Teams that run agents with real side effects and need control and evidence: mult
 - The spend threshold is checked per call, on one named argument. There is no cumulative spend cap yet, so many small calls can add up.
 - Loop detection compares the tool name and arguments. A model can vary the arguments to avoid it. The step budget is the hard stop.
 - Delivery is at-least-once, not exactly-once. If the process dies after a tool call but before the ledger records it, the call is retried with the same idempotency key. The outside service must deduplicate by that key; one that ignores keys can see one duplicate. A test pins this.
+- The audit log is tamper-evident, not tamper-proof. Editing or deleting a row inside a run's chain is detected. Deleting the last rows or a whole run is not, unless you keep the head hash somewhere else. Someone with database write access can rewrite a whole chain. It stores a hash of each request, not the arguments.
+- An empty audit chain and a missing one look the same to `verify()`, so check the row count or head hash against what you expect. Reusing an event id for different content raises an error instead of being deduplicated.
 - A call that keeps failing is retried on every resume. There is no per-call retry cap yet.
 - The time budget is checked when each tool step starts, so one slow step can overshoot it, and tool time spent before an approval pause is not counted after the pause.
 - LangGraph's checkpoint serializer rejects integers beyond 64 bits and very deep nesting, so the agent loop accepts only plain JSON tool arguments (string keys, 64-bit integers, at most 32 levels deep) and treats anything else as an invalid call.
@@ -120,7 +122,7 @@ Python 3.12, uv, LangGraph, Postgres (Docker), FastAPI, Pydantic v2, SQLAlchemy 
 
 1. Policy engine, fake LLM, tests (done; server around the engine still to do)
 2. LangGraph integration, checkpoint and resume, approvals, budgets
-3. Hash-chained audit log, dashboard
+3. Hash-chained audit log (done), dashboard
 4. MCP surface, CLI and skill, code sandbox
 5. Eval gate, recorded LLM responses, three-surface comparison
 6. Claude Code plugin and demo
