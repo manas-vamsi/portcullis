@@ -1,5 +1,5 @@
 {
-  "description": "Log every tool call. Makes no allow/deny decision yet.",
+  "description": "Check every tool call against the portcullis policy. Deny and ask are enforced; any error blocks the call.",
   "hooks": {
     "PreToolUse": [
       {
@@ -8,8 +8,9 @@
           {
             "type": "command",
             "command": "python",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/log_tool_call.py"],
-            "timeout": 10
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/policy_hook.py"],
+            "timeout": 30,
+            "onFailure": "block"
           }
         ]
       }

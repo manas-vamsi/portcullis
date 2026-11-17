@@ -19,14 +19,13 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
 
 import psycopg
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from portcullis.agent import Tool, build_agent, initial_state
-from portcullis.audit import AuditTrail, Verification, create_audit_log, verify
+from portcullis.audit import AuditTrail, Verification, create_audit_log, require_project_database, verify
 from portcullis.idempotency import create_ledger
 from portcullis.llm import LLM, FakeLLM
 from portcullis.policy import Budget, Policy, Risk, TenantPolicy, Threshold, ToolRule
@@ -275,8 +274,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not url:
         print("Set PORTCULLIS_DATABASE_URL (see .env.example), for example with: uv run --env-file .env ...", file=sys.stderr)
         return 2
-    if not urlparse(url).path.lstrip("/").startswith("portcullis"):
-        print("Refusing to run: the database name must start with 'portcullis'.", file=sys.stderr)
+    try:
+        require_project_database(url)
+    except ValueError as exc:
+        print(f"Refusing to run: {exc}.", file=sys.stderr)
         return 2
 
     names = list(SCENARIOS) if options.scenario == "all" else [options.scenario]

@@ -1,6 +1,6 @@
 {
   "name": "portcullis",
   "version": "0.1.0",
-  "description": "Policy, approval and audit layer for agent tool calls. Day-one stub: logs every call, decides nothing.",
+  "description": "Policy and audit layer for agent tool calls. Denies or asks on risky tool calls and blocks on any error.",
   "repository": "https://github.com/manas-vamsi/portcullis"
 }

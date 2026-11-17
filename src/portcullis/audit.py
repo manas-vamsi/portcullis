@@ -22,6 +22,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import psycopg
 from psycopg.pq import TransactionStatus
@@ -55,6 +56,12 @@ class Verification:
 
 class AuditConflict(Exception):
     """An event id was reused for different content. Refused, so a changed answer cannot vanish from the log."""
+
+
+def require_project_database(url: str) -> None:
+    """Refuse a database not named for this project, in case a URL points at someone else's."""
+    if not urlparse(url).path.lstrip("/").startswith("portcullis"):
+        raise ValueError("the database name must start with 'portcullis'")
 
 
 def create_audit_log(conn: psycopg.Connection) -> None:

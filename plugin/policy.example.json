@@ -1,0 +1,133 @@
+{
+  "tenants": {
+    "claude-code": {
+      "budget": {
+        "max_steps": 1000,
+        "max_tokens": 10000000,
+        "max_seconds": 86400.0,
+        "max_identical_calls": 1000
+      },
+      "tools": {
+        "Read": {
+          "risk": "read",
+          "deny_if": [
+            {
+              "arg": "file_path",
+              "regex": "(?i)(^|[\\\\/])(\\.env(\\..*)?|id_rsa|id_ed25519|credentials)[ .]*(::\\$\\w+)?$|\\.pem[ .]*(::\\$\\w+)?$",
+              "required": true
+            }
+          ]
+        },
+        "Glob": {
+          "risk": "read"
+        },
+        "Grep": {
+          "risk": "read",
+          "deny_if": [
+            {
+              "arg": "path",
+              "regex": "(?i)(^|[\\\\/])(\\.env(\\..*)?|id_rsa|id_ed25519|credentials)[ .]*(::\\$\\w+)?$|\\.pem[ .]*(::\\$\\w+)?$"
+            }
+          ]
+        },
+        "WebSearch": {
+          "risk": "read"
+        },
+        "TodoWrite": {
+          "risk": "read"
+        },
+        "Task": {
+          "risk": "read"
+        },
+        "Edit": {
+          "risk": "write",
+          "deny_if": [
+            {
+              "arg": "file_path",
+              "regex": "(?i)(^|[\\\\/])(\\.env(\\..*)?|id_rsa|id_ed25519|credentials)[ .]*(::\\$\\w+)?$|\\.pem[ .]*(::\\$\\w+)?$",
+              "required": true
+            },
+            {
+              "arg": "file_path",
+              "regex": "(?i)(^|[\\\\/])\\.portcullis[\\\\/]|[\\\\/]portcullis[\\\\/]scripts[\\\\/]|policy_hook\\.py$|(^|[\\\\/])\\.claude[\\\\/]settings[^\\\\/]*$"
+            }
+          ],
+          "ask_if": [
+            {
+              "arg": "file_path",
+              "regex": "(?i)(^|[\\\\/])\\.git[\\\\/]|[\\\\/]\\.github[\\\\/]workflows[\\\\/]"
+            }
+          ]
+        },
+        "Write": {
+          "risk": "write",
+          "deny_if": [
+            {
+              "arg": "file_path",
+              "regex": "(?i)(^|[\\\\/])(\\.env(\\..*)?|id_rsa|id_ed25519|credentials)[ .]*(::\\$\\w+)?$|\\.pem[ .]*(::\\$\\w+)?$",
+              "required": true
+            },
+            {
+              "arg": "file_path",
+              "regex": "(?i)(^|[\\\\/])\\.portcullis[\\\\/]|[\\\\/]portcullis[\\\\/]scripts[\\\\/]|policy_hook\\.py$|(^|[\\\\/])\\.claude[\\\\/]settings[^\\\\/]*$"
+            }
+          ],
+          "ask_if": [
+            {
+              "arg": "file_path",
+              "regex": "(?i)(^|[\\\\/])\\.git[\\\\/]|[\\\\/]\\.github[\\\\/]workflows[\\\\/]"
+            }
+          ]
+        },
+        "NotebookEdit": {
+          "risk": "write",
+          "deny_if": [
+            {
+              "arg": "notebook_path",
+              "regex": "(?i)(^|[\\\\/])(\\.env(\\..*)?|id_rsa|id_ed25519|credentials)[ .]*(::\\$\\w+)?$|\\.pem[ .]*(::\\$\\w+)?$",
+              "required": true
+            },
+            {
+              "arg": "notebook_path",
+              "regex": "(?i)(^|[\\\\/])\\.portcullis[\\\\/]|[\\\\/]portcullis[\\\\/]scripts[\\\\/]|policy_hook\\.py$|(^|[\\\\/])\\.claude[\\\\/]settings[^\\\\/]*$"
+            }
+          ],
+          "ask_if": [
+            {
+              "arg": "notebook_path",
+              "regex": "(?i)(^|[\\\\/])\\.git[\\\\/]|[\\\\/]\\.github[\\\\/]workflows[\\\\/]"
+            }
+          ]
+        },
+        "Bash": {
+          "risk": "write",
+          "deny_if": [
+            {
+              "arg": "command",
+              "regex": "(?is)\\brm\\s+-\\S*r\\S*\\s+(/|~)(\\s|$)",
+              "required": true
+            },
+            {
+              "arg": "command",
+              "regex": "(?is)\\b(curl|wget)\\b[^|]*\\|\\s*(sudo\\s+)?(ba|z)?sh\\b"
+            },
+            {
+              "arg": "command",
+              "regex": "(?is)\\bgit\\s+push\\b.*(--force\\b|\\s-f\\b)"
+            }
+          ],
+          "ask_if": [
+            {
+              "arg": "command",
+              "regex": "(?is)\\bgit\\s+push\\b"
+            },
+            {
+              "arg": "command",
+              "regex": "(?is)\\.portcullis|policy_hook|\\.claude[\\\\/]+settings"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
