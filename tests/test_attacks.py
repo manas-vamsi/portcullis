@@ -141,16 +141,55 @@ def test_a_spend_disguised_to_dodge_the_limit_is_refused(conn, run_id, cost):
     assert h.runs["create_work_order"] == 0
 
 
-def test_known_gap__many_small_orders_below_the_threshold_are_never_added_up(conn, run_id):
-    # Each order is under the $500 approval line, so none asks a human, though together they are $2495.
-    # A cumulative spend cap is not built yet.
-    orders = [order(f"t{i}", cost=499, unit=str(i)) for i in range(5)]
-    h = harness(conn, run_id, [reply(*orders), reply(content="done")])
+def capped_policy(cap: int) -> Policy:
+    budget = BUDGET.model_copy(update={"max_spend": cap})
+    return Policy(tenants={"acme": TenantPolicy(budget=budget, tools=acme_rules())})
+
+
+def five_small_orders() -> list[dict]:
+    return [order(f"t{i}", cost=499, unit=str(i)) for i in range(5)]  # each under the $500 approval line
+
+
+def test_many_small_orders_under_the_approval_threshold_are_stopped_by_the_spend_cap(conn, run_id):
+    h = harness(conn, run_id, [reply(*five_small_orders()), reply(content="done")], capped_policy(2000))
+
+    final = h.start()
+
+    assert [r.get("error") for r in tool_results(final)] == [None] * 4 + ["spend_cap_exceeded"]
+    assert (h.runs["create_work_order"], final["spend"]) == (4, 1996)
+
+
+def test_without_a_spend_cap_small_orders_are_never_added_up(conn, run_id):
+    # The configuration that was the gap before the cap existed: no max_spend, so $2495 goes through unasked.
+    h = harness(conn, run_id, [reply(*five_small_orders()), reply(content="done")])
 
     final = h.start()
 
     assert "__interrupt__" not in final
     assert h.runs["create_work_order"] == 5
+
+
+def test_known_gap__the_spend_cap_is_per_run_so_a_new_run_starts_at_zero(conn, run_id):
+    second = run_id + "-second"
+    try:
+        for rid in (run_id, second):
+            h = harness(conn, rid, [reply(*five_small_orders()[:4]), reply(content="done")], capped_policy(2000))
+            assert h.start()["spend"] == 1996  # each run is within its own cap, so $3992 went out in total
+            assert h.runs["create_work_order"] == 4
+    finally:
+        conn.execute("DELETE FROM audit_log WHERE run_id = %s", (second,))
+        conn.execute("DELETE FROM tool_effects WHERE run_id = %s", (second,))
+
+
+def test_a_human_approval_cannot_push_spend_past_the_cap(conn, run_id):
+    h = harness(conn, run_id, [reply(order(cost=1500), order("t2", cost=1500, unit="2")), reply(content="ok")], capped_policy(2000))
+
+    paused = h.start()
+    assert paused["__interrupt__"]
+    done = h.resume({"approved": True, "by": "alice"})  # the first is approved; the second is over the cap, so no one is asked
+
+    assert [r.get("error") for r in tool_results(done)] == [None, "spend_cap_exceeded"]
+    assert h.runs["create_work_order"] == 1
 
 
 # --- 2. poisoned tool description ---
