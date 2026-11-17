@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from portcullis.policy import (
+    ArgPattern,
     Budget,
     Policy,
     Risk,
@@ -270,3 +271,127 @@ def test_bad_policy_config_is_rejected(build):
     with pytest.raises(ValidationError):
         build()
 
+
+
+SHELL_POLICY = Policy(
+    tenants={
+        "dev": TenantPolicy(
+            budget=BUDGET,
+            tools={
+                "Bash": ToolRule(
+                    risk=Risk.WRITE,
+                    deny_if=(ArgPattern(arg="command", regex=r"(?i)\brm\s+-rf\s+/"),),
+                    ask_if=(ArgPattern(arg="command", regex=r"(?i)git\s+push"),),
+                ),
+            },
+        )
+    }
+)
+
+
+def shell(command, state=None):
+    call = ToolCall(tenant_id="dev", tool="Bash", args={"command": command})
+    return decide(SHELL_POLICY, call, state or RunState())
+
+
+def test_an_argument_that_matches_a_forbidden_pattern_is_denied_without_echoing_the_pattern():
+    decision = shell("sudo RM -RF /home")
+
+    assert (decision.verdict, decision.rule) == (Verdict.DENY, "forbidden_argument")
+    assert "rm" not in decision.reason.lower() and "command" in decision.reason
+
+
+def test_an_argument_that_matches_a_sensitive_pattern_asks_a_human():
+    decision = shell("git push origin main")
+
+    assert (decision.verdict, decision.rule) == (Verdict.ASK, "sensitive_argument")
+
+
+def test_a_forbidden_match_beats_a_sensitive_one():
+    assert shell("git push && rm -rf /").verdict is Verdict.DENY
+
+
+def test_a_command_matching_nothing_is_allowed():
+    assert shell("ls -la").verdict is Verdict.ALLOW
+
+
+def test_a_missing_inspected_argument_matches_nothing():
+    call = ToolCall(tenant_id="dev", tool="Bash", args={})
+
+    assert decide(SHELL_POLICY, call, RunState()).verdict is Verdict.ALLOW
+
+
+def test_an_inspected_argument_that_is_not_a_string_is_still_checked():
+    call = ToolCall(tenant_id="dev", tool="Bash", args={"command": ["rm", "-rf", "/"]})
+
+    assert decide(SHELL_POLICY, call, RunState()).verdict is Verdict.ALLOW  # str() of a list does not match
+    call = ToolCall(tenant_id="dev", tool="Bash", args={"command": {"cmd": "rm -rf /x"}})
+    assert decide(SHELL_POLICY, call, RunState()).verdict is Verdict.DENY
+
+
+def test_a_very_long_inspected_argument_is_denied_so_padding_cannot_hide_a_command():
+    padded = "a" * 20_000 + "; rm -rf /"
+
+    decision = shell(padded)
+
+    assert (decision.verdict, decision.rule) == (Verdict.DENY, "argument_too_long")
+
+
+def test_the_length_limit_applies_to_arguments_inspected_by_ask_rules_too():
+    policy = Policy(
+        tenants={
+            "dev": TenantPolicy(
+                budget=BUDGET,
+                tools={"Write": ToolRule(risk=Risk.WRITE, ask_if=(ArgPattern(arg="file_path", regex=r"\.env"),))},
+            )
+        }
+    )
+    call = ToolCall(tenant_id="dev", tool="Write", args={"file_path": "x" * 20_000})
+
+    assert decide(policy, call, RunState()).rule == "argument_too_long"
+
+
+def test_argument_rules_come_after_the_budget_check():
+    assert shell("ls", RunState(steps=10)).rule == "budget_exceeded"
+
+
+def test_an_invalid_regex_is_rejected_when_the_policy_loads():
+    with pytest.raises(ValidationError):
+        ArgPattern(arg="command", regex="(unclosed")
+
+
+def test_argument_rules_load_from_json():
+    raw = {
+        "tenants": {
+            "dev": {
+                "budget": BUDGET.model_dump(),
+                "tools": {"Bash": {"risk": "write", "deny_if": [{"arg": "command", "regex": "rm -rf"}]}},
+            }
+        }
+    }
+
+    policy = Policy.model_validate(raw)
+
+    assert policy.tenants["dev"].tools["Bash"].deny_if[0].regex == "rm -rf"
+
+
+def test_a_required_argument_that_is_missing_is_denied_not_ignored():
+    # A typo in the argument name (file_path vs notebook_path) must not silently switch a rule off.
+    policy = Policy(
+        tenants={
+            "dev": TenantPolicy(
+                budget=BUDGET,
+                tools={
+                    "Edit": ToolRule(
+                        risk=Risk.WRITE, deny_if=(ArgPattern(arg="file_path", regex=r"\.env", required=True),)
+                    )
+                },
+            )
+        }
+    )
+
+    missing = decide(policy, ToolCall(tenant_id="dev", tool="Edit", args={"path": "x"}), RunState())
+    present = decide(policy, ToolCall(tenant_id="dev", tool="Edit", args={"file_path": "a.py"}), RunState())
+
+    assert (missing.verdict, missing.rule) == (Verdict.DENY, "missing_argument")
+    assert present.verdict is Verdict.ALLOW

@@ -11,10 +11,13 @@ must fill `tenant_id` (from the authenticated identity) and `definition_sha256`
 import hashlib
 import json
 import math
+import re
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+MAX_PATTERN_INPUT = 10_000  # longer inspected arguments are denied: bounds regex cost and blocks padding
 
 
 class Risk(StrEnum):
@@ -40,10 +43,33 @@ class Threshold(_Frozen):
     limit: float = Field(ge=0, allow_inf_nan=False)
 
 
+class ArgPattern(_Frozen):
+    """A regex searched in the string form of the named argument. Add (?i) for case-insensitive.
+
+    Patterns are trusted policy config run against model-controlled text, so avoid nested
+    quantifiers: Python's re has no timeout.
+    """
+
+    arg: str
+    regex: str
+    required: bool = False  # if true, a call without this argument is denied, so a typo in `arg` cannot switch the rule off
+
+    @field_validator("regex")
+    @classmethod
+    def _must_compile(cls, regex: str) -> str:
+        try:
+            re.compile(regex)
+        except re.error as exc:
+            raise ValueError(f"invalid regex: {exc}") from exc
+        return regex
+
+
 class ToolRule(_Frozen):
     risk: Risk
     pinned_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     approve_above: Threshold | None = None
+    deny_if: tuple[ArgPattern, ...] = ()  # a match denies the call
+    ask_if: tuple[ArgPattern, ...] = ()  # a match asks a human
 
 
 class Budget(_Frozen):
@@ -144,6 +170,42 @@ def _check_amount(rule: ToolRule, call: ToolCall) -> Decision | None:
     )
 
 
+def _argument_text(call: ToolCall, name: str) -> str | None:
+    value = call.args.get(name)
+    if value is None:
+        return None
+    return value if isinstance(value, str) else str(value)
+
+
+def _first_match(patterns: tuple[ArgPattern, ...], call: ToolCall) -> ArgPattern | None:
+    for pattern in patterns:
+        text = _argument_text(call, pattern.arg)
+        if text is not None and re.search(pattern.regex, text):
+            return pattern
+    return None
+
+
+def _check_arguments(rule: ToolRule, call: ToolCall) -> Decision | None:
+    """Deny on an oversized inspected argument or a forbidden pattern. Never echoes the pattern itself."""
+    for pattern in (*rule.deny_if, *rule.ask_if):
+        text = _argument_text(call, pattern.arg)
+        if text is None and pattern.required:
+            return _decision(Verdict.DENY, "missing_argument", f"required argument {pattern.arg!r} is missing")
+        if text is not None and len(text) > MAX_PATTERN_INPUT:
+            return _decision(Verdict.DENY, "argument_too_long", f"argument {pattern.arg!r} is too long to inspect")
+    hit = _first_match(rule.deny_if, call)
+    if hit:
+        return _decision(Verdict.DENY, "forbidden_argument", f"argument {hit.arg!r} matches a forbidden pattern")
+    return None
+
+
+def _check_sensitive(rule: ToolRule, call: ToolCall) -> Decision | None:
+    hit = _first_match(rule.ask_if, call)
+    if hit:
+        return _decision(Verdict.ASK, "sensitive_argument", f"argument {hit.arg!r} matches a sensitive pattern")
+    return None
+
+
 def _check_approval(rule: ToolRule, call: ToolCall) -> Decision | None:
     if rule.risk is Risk.IRREVERSIBLE:
         return _decision(Verdict.ASK, "irreversible_action", f"{call.tool!r} cannot be undone")
@@ -176,7 +238,9 @@ def _decide(policy: Policy, call: ToolCall, state: RunState) -> Decision:
     return (
         _check_pin(rule, call)
         or _check_amount(rule, call)
+        or _check_arguments(rule, call)
         or _check_approval(rule, call)
+        or _check_sensitive(rule, call)
         or _decision(Verdict.ALLOW, "allowed", f"{rule.risk} tool {call.tool!r} is allowed")
     )
 
