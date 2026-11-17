@@ -27,6 +27,7 @@ TEST_EFFECTS_SETUP = (
 
 @pytest.fixture(scope="session")
 def postgres_url() -> str:
+    from portcullis.audit import create_audit_log
     from portcullis.idempotency import create_ledger
 
     url = os.environ.get("PORTCULLIS_DATABASE_URL")
@@ -40,6 +41,7 @@ def postgres_url() -> str:
         saver.setup()
     with psycopg.connect(url, autocommit=True) as conn:
         create_ledger(conn)
+        create_audit_log(conn)
         for statement in TEST_EFFECTS_SETUP:
             conn.execute(statement)
     return url
@@ -58,3 +60,4 @@ def run_id(conn):
     rid = f"run-{uuid4()}"
     yield rid
     conn.execute("DELETE FROM tool_effects WHERE run_id = %s", (rid,))
+    conn.execute("DELETE FROM audit_log WHERE run_id = %s", (rid,))
