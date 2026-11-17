@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 
@@ -115,6 +116,16 @@ def fingerprint(tool: str, args: dict[str, Any]) -> str:
     # default=str is best effort for non-JSON values (args normally come from JSON).
     # Any remaining failure is caught by decide() and becomes a deny.
     canonical = json.dumps({"tool": tool, "args": args}, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def definition_hash(definition: Mapping[str, Any]) -> str:
+    """Hash of a tool definition (name, description, input schema: whatever the model is shown).
+
+    Pin the hash of a definition you reviewed in ToolRule.pinned_sha256. Strict JSON, no fallback to
+    str(): a definition that cannot be hashed exactly raises instead of hashing something vaguer.
+    """
+    canonical = json.dumps(definition, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 

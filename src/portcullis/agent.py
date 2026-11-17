@@ -32,7 +32,14 @@ the ledger stops calls that already ran from running again.
 
 Known limits: the time budget is checked when each tool step starts, so one slow step can
 overshoot it, and tool time spent before an approval pause is not counted after the pause.
-Pinned tool definitions are not wired yet: no hash is supplied, so a pinned tool is always denied.
+Pinned tool definitions: pass `definitions`, a function from tool name to the definition as it is
+advertised right now (or None). It is asked again for every call, so a definition that changes
+mid-run (a rug pull) is caught on its next call. A pinned tool is refused when the hash differs,
+when no `definitions` function is given, or when it fails or returns None. If a definition changes
+while a call waits for approval, the resume decides the call again, logs a different definition
+hash for the same call, and the audit log refuses it with AuditConflict, so the tool does not run.
+That happens for any tool with a definition, pinned or not. The pin proves the definition is the
+one you reviewed, not that the server behind it does what the definition says.
 """
 
 import json
@@ -50,9 +57,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from portcullis.audit import AuditTrail
 from portcullis.idempotency import idempotency_key, run_once
 from portcullis.llm import LLM
-from portcullis.policy import Decision, Policy, RunState, ToolCall, Verdict, decide, fingerprint
+from portcullis.policy import Decision, Policy, RunState, ToolCall, Verdict, decide, definition_hash, fingerprint
 
 Tool = Callable[[dict[str, Any], str], Any]  # (args, idempotency key) -> JSON-compatible result
+Definitions = Callable[[str], Mapping[str, Any] | None]  # tool name -> its definition as advertised now
 HALTING_RULES = frozenset({"budget_exceeded", "loop_detected", "unknown_tenant"})
 # Stands in for a malformed call so it still counts against the budget. All malformed calls share
 # one fingerprint, so max_identical_calls of them in a run is treated as a loop.
@@ -191,7 +199,26 @@ def _execute(
     return _tool_message(call.id, {"result": result})
 
 
-def _log_decision(trail: AuditTrail, position_id: str, name: str, args: dict[str, Any], decision: Decision) -> None:
+def _live_hash(definitions: Definitions | None, name: str) -> str | None:
+    """Hash of the definition advertised right now. Any failure counts as no definition, so a pinned tool is refused."""
+    if definitions is None:
+        return None
+    try:
+        definition = definitions(name)
+        return None if definition is None else definition_hash(definition)
+    except Exception:
+        return None
+
+
+def _log_decision(
+    trail: AuditTrail,
+    position_id: str,
+    name: str,
+    args: dict[str, Any],
+    decision: Decision,
+    definition_sha256: str | None = None,
+) -> None:
+    extra = {} if definition_sha256 is None else {"definition_sha256": definition_sha256}
     trail.record(
         f"{position_id}:decision",
         "decision",
@@ -202,6 +229,7 @@ def _log_decision(trail: AuditTrail, position_id: str, name: str, args: dict[str
             "rule": decision.rule,
             "reason": decision.reason,
             "request_sha256": fingerprint(name, args),  # a hash, not the arguments, which may be sensitive
+            **extra,
         },
     )
 
@@ -285,7 +313,9 @@ def make_agent_node(llm: LLM) -> Node:
     return agent_node
 
 
-def make_tools_node(policy: Policy, tools: Mapping[str, Tool], conn: psycopg.Connection) -> Node:
+def make_tools_node(
+    policy: Policy, tools: Mapping[str, Tool], conn: psycopg.Connection, definitions: Definitions | None = None
+) -> Node:
     def tools_node(state: AgentState) -> dict[str, Any]:
         started = time.perf_counter()
         position = len(state["messages"]) - 1
@@ -305,8 +335,11 @@ def make_tools_node(policy: Policy, tools: Mapping[str, Tool], conn: psycopg.Con
             run_state = RunState(
                 steps=steps, tokens=state["tokens"], seconds=state["seconds"], history=tuple(history)
             )
-            decision = decide(policy, ToolCall(tenant_id=state["tenant_id"], tool=name, args=args), run_state)
-            _log_decision(trail, position_id, name, args, decision)  # written before anything runs
+            seen = _live_hash(definitions, name) if call else None
+            decision = decide(
+                policy, ToolCall(tenant_id=state["tenant_id"], tool=name, args=args, definition_sha256=seen), run_state
+            )
+            _log_decision(trail, position_id, name, args, decision, seen)  # written before anything runs
             steps += 1
             history.append(fingerprint(name, args))
 
@@ -342,11 +375,12 @@ def build_agent(
     tools: Mapping[str, Tool],
     conn: psycopg.Connection,
     checkpointer: BaseCheckpointSaver,
+    definitions: Definitions | None = None,
 ) -> CompiledStateGraph:
     """Compile the guarded agent. A checkpointer is required: approvals pause the run with interrupt()."""
     graph = StateGraph(AgentState)
     graph.add_node("agent", make_agent_node(llm))
-    graph.add_node("tools", make_tools_node(policy, tools, conn))
+    graph.add_node("tools", make_tools_node(policy, tools, conn, definitions))
     graph.add_edge(START, "agent")
     graph.add_conditional_edges("agent", _after_agent, ["tools", END])
     graph.add_conditional_edges("tools", _after_tools, ["agent", END])

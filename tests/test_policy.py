@@ -1,4 +1,5 @@
 import math
+import re
 
 import pytest
 from pydantic import ValidationError
@@ -15,6 +16,7 @@ from portcullis.policy import (
     ToolRule,
     Verdict,
     decide,
+    definition_hash,
     fingerprint,
 )
 
@@ -395,3 +397,12 @@ def test_a_required_argument_that_is_missing_is_denied_not_ignored():
 
     assert (missing.verdict, missing.rule) == (Verdict.DENY, "missing_argument")
     assert present.verdict is Verdict.ALLOW
+
+
+def test_a_definition_hash_ignores_key_order_and_changes_with_any_field():
+    base = {"name": "t", "description": "d", "schema": {"a": "string", "b": "int"}}
+    same = {"schema": {"b": "int", "a": "string"}, "description": "d", "name": "t"}
+    assert definition_hash(base) == definition_hash(same)
+    assert re.fullmatch(r"[0-9a-f]{64}", definition_hash(base))
+    for field, value in (("description", "d "), ("name", "u"), ("schema", {"a": "int", "b": "int"})):
+        assert definition_hash(base | {field: value}) != definition_hash(base)
