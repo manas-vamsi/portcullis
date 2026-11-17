@@ -28,10 +28,10 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 | Capability | What it means | Status |
 |---|---|---|
 | Tool allowlists and risk levels | Per-tenant rules; each tool is `read`, `write` or `irreversible` | Built (policy engine) |
-| Human approval | Irreversible actions and spend above a threshold wait for an explicit approve or deny | Engine returns `ask`; approval flow planned |
+| Human approval | Irreversible actions and spend above a threshold wait for an explicit approve or deny | Built in the LangGraph agent loop (pauses with `interrupt`, only a named explicit approval counts, the approver is recorded in state and never shown to the model); approval UI and the tamper-evident audit log planned |
 | Tamper-evident audit log | Hash-chained records of who approved what and when | Planned |
-| Budgets and loop detection | Limits on steps, tokens and time, enforced by the runtime | Decision logic built; runtime counters planned |
-| Idempotency keys | A crash and resume does not repeat a side effect | Built as a library (Postgres ledger); not yet wired into the agent runtime |
+| Budgets and loop detection | Limits on steps, tokens and time, enforced by the runtime | Built in the LangGraph agent loop; a breach halts the run |
+| Idempotency keys | A crash and resume does not repeat a side effect | Built (Postgres ledger), wired into the LangGraph agent loop |
 | Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Hash check built; reading MCP definitions planned |
 | Crash recovery | Resume a run from a Postgres checkpoint (LangGraph) | Tested with a hard-killed worker, including the repeat-effect cases below |
 | Tracing | Every run can be inspected end to end (OpenTelemetry) | Planned |
@@ -64,7 +64,7 @@ The same policy engine is reached through several entry points, so the rules are
 
 ## Ways to use it (planned)
 
-1. **Python library**: wrap a LangGraph agent's tool calls.
+1. **Python library**: a guarded LangGraph agent loop where every tool call goes through the policy, approval and ledger (first version built; see `src/portcullis/agent.py`).
 2. **Server**: FastAPI policy engine with a Postgres audit log.
 3. **CLI** (`agentctl`): inspect runs, approve actions, verify the audit chain.
 4. **Skill**: a portable `SKILL.md` folder for coding agents that support the open skill format.
@@ -103,7 +103,10 @@ Teams that run agents with real side effects and need control and evidence: mult
 - Loop detection compares the tool name and arguments. A model can vary the arguments to avoid it. The step budget is the hard stop.
 - Delivery is at-least-once, not exactly-once. If the process dies after a tool call but before the ledger records it, the call is retried with the same idempotency key. The outside service must deduplicate by that key; one that ignores keys can see one duplicate. A test pins this.
 - A call that keeps failing is retried on every resume. There is no per-call retry cap yet.
-- The ledger assumes a call id that stays the same across a resume. Wiring it to LangGraph's tool call ids is not done or verified yet.
+- The time budget is checked when each tool step starts, so one slow step can overshoot it, and tool time spent before an approval pause is not counted after the pause.
+- LangGraph's checkpoint serializer rejects integers beyond 64 bits, so the agent loop treats a tool call carrying one as invalid rather than letting it break the run.
+- The ledger call id is the message and call position in the checkpointed history, not the model's tool-call id, so a model that reuses ids cannot collide with the ledger.
+- Pinned tool definitions are not wired into the agent loop yet, so a pinned tool is always denied there.
 - The engine trusts its caller for the tenant and for the hash of the live tool definition. These must come from the runtime (authenticated identity, the real MCP definition), never from model output.
 
 ## Stack
@@ -146,4 +149,4 @@ The test suite is the only thing to run so far. This section will grow with the 
 
 ## Data and licensing notes
 
-All demo data is synthetic. No employer code or data is used. A license has not been chosen yet.
+All demo data is synthetic. No employer code or data is used. Licensed under the MIT License (see `LICENSE`).
