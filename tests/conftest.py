@@ -7,6 +7,7 @@ Postgres tests run only when PORTCULLIS_DATABASE_URL is set. See .env.example, t
 
 import os
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import psycopg
 import pytest
@@ -42,3 +43,18 @@ def postgres_url() -> str:
         for statement in TEST_EFFECTS_SETUP:
             conn.execute(statement)
     return url
+
+
+@pytest.fixture
+def conn(postgres_url):
+    """An autocommit connection, as the ledger requires."""
+    with psycopg.connect(postgres_url, autocommit=True) as connection:
+        yield connection
+
+
+@pytest.fixture
+def run_id(conn):
+    """A fresh run id whose ledger rows are removed afterwards."""
+    rid = f"run-{uuid4()}"
+    yield rid
+    conn.execute("DELETE FROM tool_effects WHERE run_id = %s", (rid,))

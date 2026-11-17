@@ -10,8 +10,8 @@ its result.
   external service must deduplicate by that key; one that ignores keys can see a duplicate.
 - If two attempts both finish, the first to record its result wins and both return it.
 
-Use a call_id that stays the same across a resume (for example the model's tool_call_id from
-checkpointed state), never one made fresh on each attempt.
+Use a call_id that stays the same across a resume and that the model cannot choose (agent.py
+uses the call's position in the checkpointed history), never one made fresh on each attempt.
 """
 
 import hashlib

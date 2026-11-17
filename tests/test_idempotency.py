@@ -1,6 +1,5 @@
 import math
 from decimal import Decimal
-from uuid import uuid4
 
 import psycopg
 import pytest
@@ -13,19 +12,6 @@ def test_key_is_deterministic_and_depends_on_run_and_call():
     assert idempotency_key("r", "c") != idempotency_key("r", "d")
     assert idempotency_key("r", "c") != idempotency_key("s", "c")
     assert idempotency_key("ab", "c") != idempotency_key("a", "bc")  # no delimiter ambiguity
-
-
-@pytest.fixture
-def conn(postgres_url):
-    with psycopg.connect(postgres_url, autocommit=True) as connection:
-        yield connection
-
-
-@pytest.fixture
-def run_id(conn):
-    rid = f"run-{uuid4()}"
-    yield rid
-    conn.execute("DELETE FROM tool_effects WHERE run_id = %s", (rid,))
 
 
 class Provider:
