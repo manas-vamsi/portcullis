@@ -75,13 +75,15 @@ The same policy engine is reached through several entry points, so the rules are
 
 ## Demo domain
 
-A property-management maintenance triage agent, built on **synthetic data only**.
+A property-management maintenance triage agent, built on **synthetic data only** (`src/portcullis/demo.py`). The model is scripted, so the demo needs no LLM and no quota, but the policy engine, approvals, idempotency ledger and audit log are the real ones.
 
 - `check_vendor_availability` (read)
 - `create_work_order` (write, can be undone with `cancel_work_order`)
-- `notify_tenant` (idempotent)
-- Spend above a threshold needs human approval.
-- Emergency words such as "gas leak" skip the model and escalate to a human deterministically.
+- `notify_tenant` (write, deduplicated by idempotency key)
+- Work orders above $500 need human approval.
+- Emergency words such as "gas leak" or "on fire" skip the model and escalate to a human through plain keyword rules. The list is short and not exhaustive.
+
+Five scenarios: `routine`, `expensive` (approved), `expensive_denied`, `emergency`, and `attack` (a forbidden tool, then a spend sent as a string to dodge the limit). Each prints its transcript and verifies its audit chain. See "Getting started" to run it.
 
 ## Research question
 
@@ -146,6 +148,8 @@ The Postgres tests (checkpoint and kill-and-resume) need the database container:
 cp .env.example .env     # then put the same real password in both lines
 docker compose up -d --wait
 uv run --env-file .env pytest
+uv run --env-file .env python -m portcullis.demo                      # all five demo scenarios
+uv run --env-file .env python -m portcullis.demo --scenario expensive  # one of them
 ```
 
 The container listens on `127.0.0.1:5433` only. Without `.env`, the Postgres tests are skipped. The test setup refuses to run against any database whose name does not start with `portcullis`.
