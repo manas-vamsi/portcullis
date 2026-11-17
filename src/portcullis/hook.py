@@ -56,16 +56,19 @@ def _read_event(stdin: bytes) -> dict[str, Any]:
     return event
 
 
-def _load_policy(env: Mapping[str, str]) -> Policy:
-    project = env.get("CLAUDE_PROJECT_DIR")
-    default = Path(project) / DEFAULT_POLICY if project else Path(DEFAULT_POLICY)
-    path = Path(env.get("PORTCULLIS_POLICY") or default)
+def load_policy(path: Path) -> Policy:
     try:
         return Policy.model_validate_json(path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise HookError(f"cannot read policy {path}: {exc.strerror}") from exc
     except (ValidationError, UnicodeDecodeError) as exc:
         raise HookError(f"policy {path} is invalid") from exc
+
+
+def _load_policy(env: Mapping[str, str]) -> Policy:
+    project = env.get("CLAUDE_PROJECT_DIR")
+    default = Path(project) / DEFAULT_POLICY if project else Path(DEFAULT_POLICY)
+    return load_policy(Path(env.get("PORTCULLIS_POLICY") or default))
 
 
 def _audit(env: Mapping[str, str], event: dict[str, Any], tenant: str, decision: Decision) -> None:

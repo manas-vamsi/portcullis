@@ -122,6 +122,15 @@ def verify(conn: psycopg.Connection, run_id: str) -> Verification:
     return Verification(True, len(rows), prev, None)
 
 
+def events(conn: psycopg.Connection, run_id: str) -> list[dict[str, Any]]:
+    """Every row of a run in order, as stored. Does not check the chain; call verify() for that."""
+    rows = conn.execute(
+        "SELECT idx, event_id, tenant_id, event, ts, payload FROM audit_log WHERE run_id = %s ORDER BY idx",
+        (run_id,),
+    ).fetchall()
+    return [dict(zip(("idx", "event_id", "tenant_id", "event", "ts", "payload"), row)) for row in rows]
+
+
 @dataclass(frozen=True)
 class AuditTrail:
     """The audit log for one run of one tenant."""
