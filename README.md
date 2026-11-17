@@ -1,5 +1,7 @@
 # Portcullis
 
+[![CI](https://github.com/manas-vamsi/portcullis/actions/workflows/ci.yml/badge.svg)](https://github.com/manas-vamsi/portcullis/actions/workflows/ci.yml)
+
 **A control layer between AI agents and the tools they use.**
 
 Portcullis sits in front of an agent's tools and decides, with plain deterministic rules, what the agent is allowed to do. It can allow a call, block it, or pause it until a human approves. Every decision is written to a tamper-evident audit log.
