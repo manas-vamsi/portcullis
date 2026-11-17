@@ -6,7 +6,7 @@
 
 Portcullis sits in front of an agent's tools and decides, with plain deterministic rules, what the agent is allowed to do. It can allow a call, block it, or pause it until a human approves. Every decision is written to a tamper-evident audit log.
 
-> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). The server and dashboard are not. A feature is marked as built only when it has tests behind it; everything else is design.
+> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The attack suite runs scripted-model attacks against the policy. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). The server and dashboard are not. A feature is marked as built only when it has tests behind it; everything else is design.
 
 ---
 
@@ -34,7 +34,7 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 | Tamper-evident audit log | Hash-chained records of every decision, who approved or denied what, and what ran | Built (one chain per run in Postgres, wired into the agent loop); read and verify with `agentctl`; no dashboard yet |
 | Budgets and loop detection | Limits on steps, tokens and time, enforced by the runtime | Built in the LangGraph agent loop; a breach halts the run |
 | Idempotency keys | A crash and resume does not repeat a side effect | Built (Postgres ledger), wired into the LangGraph agent loop |
-| Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Hash check built; reading MCP definitions planned |
+| Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Built in the agent loop: you supply a function that returns each tool's current definition, and a pinned tool whose hash changed (or that cannot be read) is refused; reading definitions from a real MCP server is planned |
 | Crash recovery | Resume a run from a Postgres checkpoint (LangGraph) | Tested with a hard-killed worker, including the repeat-effect cases below |
 | Tracing | Every run can be inspected end to end (OpenTelemetry) | Planned |
 | Eval gate | Block a release if the agent got measurably worse | Planned |
@@ -109,6 +109,19 @@ Protect the policy itself. The example denies file tools from writing `.portcull
 
 Checked with a real Claude Code session on Windows: a read of a normal file went through, a read of a file named `.env` was refused with the reason above, and both decisions appeared in the audit chain.
 
+## Attack suite
+
+`tests/test_attacks.py` scripts a model that has been fully hijacked and checks what still gets through. The dangerous tools are implemented and counted, so "never ran" is measured. **No real LLM is called**, so this shows what the deterministic layer does when a model is fooled, not whether a real model resists these attacks.
+
+| Attack | What the tests show | Gap |
+|---|---|---|
+| Prompt injection in a tool result | The injected text reaches the model; calls to tools off the allowlist are refused and never run. A call that claims `approved: true` still waits for a human, and only a named explicit answer approves. A repeat loop is halted. A secret sent through an allowed tool waits for approval. Spend disguised as a string, a bool, a negative or NaN is refused. | **Many small orders under the approval threshold are never added up** (5 orders of 499 all run). A cumulative spend cap is not built. |
+| Poisoned tool description | A model that obeys a poisoned description still cannot call unlisted tools. A description changed after review is refused by its pin. | **A description that was already poisoned when you pinned it passes the pin.** Review the text before pinning. |
+| Rug pull (definition changes later) | A definition that changes mid-run is refused from the next call. One that changes while a call waits for approval stops the call. | Definitions come from a function you supply; reading them from a real MCP server is not built. |
+| Confused deputy | The acting tenant comes from the caller, so a model naming another tenant gains nothing. A work order for another tenant's vendor is refused, including with a newline, a leading space, a list or a missing id. | **The policy checks the text of an id, not who owns it.** The tool's own backend must check ownership too. |
+
+Tests named `test_known_gap__...` pin the weaknesses above so they cannot change or be forgotten silently. Run it with `uv run --env-file .env pytest tests/test_attacks.py -v` (it needs the Postgres container). Claude Code hook attacks (editing the policy, `.env` evasions, hook failures) are covered in `tests/test_hook_policy.py`, and a cross-tenant replay of the idempotency ledger in `tests/test_agent.py`.
+
 ## agentctl
 
 A small read-only command line for the audit log and the policy (`uv run agentctl --help`).
@@ -155,7 +168,7 @@ Teams that run agents with real side effects and need control and evidence: mult
 - LangGraph's checkpoint serializer rejects integers beyond 64 bits and very deep nesting, so the agent loop accepts only plain JSON tool arguments (string keys, 64-bit integers, at most 32 levels deep) and treats anything else as an invalid call.
 - All malformed tool calls share one loop fingerprint, so a run with `max_identical_calls` of them is halted as a loop.
 - The ledger call id is the message and call position in the checkpointed history, not the model's tool-call id, so a model that reuses ids cannot collide with the ledger.
-- Pinned tool definitions are not wired into the agent loop yet, so a pinned tool is always denied there.
+- A pin proves a tool's definition is the one you reviewed, not that it is safe or that the server behind it does what the definition says. If a definition changes while a call waits for approval, the call is stopped with an `AuditConflict` error rather than run. Definitions are not read from a real MCP server yet.
 - The engine trusts its caller for the tenant and for the hash of the live tool definition. These must come from the runtime (authenticated identity, the real MCP definition), never from model output.
 
 ## Stack
@@ -170,7 +183,7 @@ Python 3.12, uv, LangGraph, Postgres (Docker), FastAPI, Pydantic v2, SQLAlchemy 
 4. MCP surface, CLI and skill, code sandbox
 5. Eval gate, recorded LLM responses, three-surface comparison
 6. Claude Code plugin and demo
-7. Executable attack suite (poisoned tool description, rug pull, confused deputy, prompt injection in a tool result)
+7. Executable attack suite (done: see "Attack suite"; it also lists the gaps it found)
 8. Benchmarks, architecture decision records, docs
 
 ## Getting started
