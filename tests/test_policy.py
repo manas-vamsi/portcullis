@@ -199,9 +199,24 @@ def test_a_crash_while_deciding_is_a_deny_not_an_exception(tool_call):
 def test_checks_stop_at_the_first_deny_so_later_checks_cannot_crash_it():
     crashing_args = {"x": {1: "a", "b": 2}}  # would crash the loop check's fingerprint
 
-    decision = check(call("pinned_tool", definition_sha256="b" * 64, args=crashing_args))
+    decision = check(call(args=crashing_args), RunState(steps=10))
 
-    assert (decision.verdict, decision.rule) == (Verdict.DENY, "definition_drift")
+    assert (decision.verdict, decision.rule) == (Verdict.DENY, "budget_exceeded")
+
+
+def test_an_exhausted_budget_denies_even_a_tool_that_is_not_allowlisted():
+    # Otherwise a model that keeps calling forbidden tools would never be stopped.
+    decision = check(call(tool="drop_database"), RunState(steps=10))
+
+    assert (decision.verdict, decision.rule) == (Verdict.DENY, "budget_exceeded")
+
+
+def test_repeating_a_call_to_a_tool_that_is_not_allowlisted_is_a_loop():
+    same = fingerprint("drop_database", {})
+
+    decision = check(call(tool="drop_database"), RunState(history=(same,) * 3))
+
+    assert (decision.verdict, decision.rule) == (Verdict.DENY, "loop_detected")
 
 
 def test_names_are_quoted_in_reasons_so_they_cannot_forge_log_lines():

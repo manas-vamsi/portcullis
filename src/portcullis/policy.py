@@ -162,16 +162,19 @@ def _decide(policy: Policy, call: ToolCall, state: RunState) -> Decision:
     tenant = policy.tenants.get(call.tenant_id)
     if tenant is None:
         return _decision(Verdict.DENY, "unknown_tenant", f"no policy for tenant {call.tenant_id!r}")
+    # Budget and loop checks come first and cover every call, even one for a tool that is not
+    # allowed. Otherwise a model that keeps calling forbidden tools would never be stopped.
+    # `or` stops at the first hit. (Decision is a pydantic model and always truthy.)
+    over_limit = _check_budget(tenant.budget, state) or _check_loop(tenant.budget, call, state)
+    if over_limit:
+        return over_limit
     rule = tenant.tools.get(call.tool)
     if rule is None:
         return _decision(Verdict.DENY, "tool_not_allowed", f"{call.tool!r} is not on the allowlist")
 
-    # `or` stops at the first hit. Order matters: all denies come before the ask, so deny beats ask.
-    # (Decision is a pydantic model and always truthy.)
+    # Order matters: all denies come before the ask, so deny beats ask.
     return (
         _check_pin(rule, call)
-        or _check_budget(tenant.budget, state)
-        or _check_loop(tenant.budget, call, state)
         or _check_amount(rule, call)
         or _check_approval(rule, call)
         or _decision(Verdict.ALLOW, "allowed", f"{rule.risk} tool {call.tool!r} is allowed")
