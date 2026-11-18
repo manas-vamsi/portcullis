@@ -35,6 +35,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.3
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --all-extras
       - name: Test (unit, Postgres and kill-and-resume)
         run: uv run --no-sync pytest -q --cov=portcullis --cov-report=term-missing
