@@ -57,8 +57,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from portcullis.audit import AuditTrail
 from portcullis.idempotency import idempotency_key, run_once
+from portcullis.jsondata import MAX_INT, check_json
 from portcullis.llm import LLM
 from portcullis.policy import (
+    HALTING_RULES,
     Decision,
     Policy,
     RunState,
@@ -72,14 +74,9 @@ from portcullis.policy import (
 
 Tool = Callable[[dict[str, Any], str], Any]  # (args, idempotency key) -> JSON-compatible result
 Definitions = Callable[[str], Mapping[str, Any] | None]  # tool name -> its definition as advertised now
-HALTING_RULES = frozenset({"budget_exceeded", "loop_detected", "unknown_tenant"})
 # Stands in for a malformed call so it still counts against the budget. All malformed calls share
 # one fingerprint, so max_identical_calls of them in a run is treated as a loop.
 INVALID_TOOL = "<invalid-tool-call>"
-MAX_INT, MIN_INT = 2**64 - 1, -(2**63)  # LangGraph's checkpoint serializer fails outside this range
-MAX_DEPTH = 32  # ...and on data nested about 250 levels deep; tool arguments never need more than this
-
-
 class AgentState(TypedDict):
     tenant_id: str
     run_id: str
@@ -96,27 +93,6 @@ class AgentState(TypedDict):
 Node = Callable[[AgentState], dict[str, Any]]
 
 
-def _check_json(value: Any, depth: int = 0) -> None:
-    """Only plain JSON data may enter the checkpointed state."""
-    if depth > MAX_DEPTH:
-        raise ValueError("nested too deeply")
-    if value is None or isinstance(value, (bool, str, float)):
-        return
-    if isinstance(value, int):
-        if not MIN_INT <= value <= MAX_INT:
-            raise ValueError("integer outside the 64-bit range")
-    elif isinstance(value, list):
-        for item in value:
-            _check_json(item, depth + 1)
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError("object keys must be strings")
-            _check_json(item, depth + 1)
-    else:
-        raise ValueError(f"{type(value).__name__} is not JSON data")
-
-
 class ModelToolCall(BaseModel):
     """What the model asked for. Strict, because the model is untrusted."""
 
@@ -129,7 +105,7 @@ class ModelToolCall(BaseModel):
     @field_validator("args")
     @classmethod
     def _args_must_be_safe_to_store(cls, args: dict[str, Any]) -> dict[str, Any]:
-        _check_json(args)  # a ValueError here becomes a ValidationError, so the call is invalid
+        check_json(args)  # a ValueError here becomes a ValidationError, so the call is invalid
         return args
 
 

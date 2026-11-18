@@ -21,6 +21,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 MAX_PATTERN_INPUT = 10_000  # longer inspected arguments are denied: bounds regex cost and blocks padding
 
 
+# Rules after which a run should stop: the caller is out of budget, looping, or has no policy at all.
+HALTING_RULES = frozenset({"budget_exceeded", "loop_detected", "unknown_tenant"})
+
+
 class Risk(StrEnum):
     READ = "read"
     WRITE = "write"

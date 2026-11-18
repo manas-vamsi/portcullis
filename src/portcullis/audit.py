@@ -58,6 +58,11 @@ class AuditConflict(Exception):
     """An event id was reused for different content. Refused, so a changed answer cannot vanish from the log."""
 
 
+def namespaced(tenant: str, run_id: str) -> str:
+    """The run name the server stores in the audit log. JSON keeps ("a", "b/c") and ("a/b", "c") apart."""
+    return json.dumps([tenant, run_id])
+
+
 def require_project_database(url: str) -> None:
     """Refuse a database not named for this project, in case a URL points at someone else's."""
     if not urlparse(url).path.lstrip("/").startswith("portcullis"):
@@ -102,6 +107,14 @@ def append(conn: psycopg.Connection, run_id: str, tenant_id: str, event_id: str,
             (run_id, idx, event_id, tenant_id, event, ts, body, prev, row_hash),
         )
     return row_hash
+
+
+def payload_data(text: str) -> Any:
+    """A row's payload as data. A tampered row may not be JSON; it is then returned as the stored text."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
 
 
 def verify(conn: psycopg.Connection, run_id: str) -> Verification:
