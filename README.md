@@ -6,7 +6,7 @@
 
 Portcullis sits in front of an agent's tools and decides, with plain deterministic rules, what the agent is allowed to do. It can allow a call, block it, or pause it until a human approves. Every decision is written to a tamper-evident audit log.
 
-> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The attack suite runs scripted-model attacks against the policy. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). The server and dashboard are not. A feature is marked as built only when it has tests behind it; everything else is design.
+> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The attack suite runs scripted-model attacks against the policy. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). A first HTTP server is built (authenticated decisions, human approvals and the audit trail). The dashboard is not. A feature is marked as built only when it has tests behind it; everything else is design.
 
 ---
 
@@ -67,7 +67,7 @@ The same policy engine is reached through several entry points, so the rules are
 ## Ways to use it (planned)
 
 1. **Python library**: a guarded LangGraph agent loop where every tool call goes through the policy, approval and ledger (first version built; see `src/portcullis/agent.py`).
-2. **Server**: FastAPI policy engine with a Postgres audit log.
+2. **Server** (first version built, see below): a FastAPI service where an agent runtime asks before each tool call, a human approves or denies the pending ones, and everything lands in the Postgres audit log.
 3. **CLI** (`agentctl`, first version built, see below): verify and read an audit chain, dry-run a policy. Approving actions from the CLI is not built.
 4. **Skill**: a portable `SKILL.md` folder for coding agents that support the open skill format.
 5. **Claude Code plugin** (first version built, see below): a `PreToolUse` hook checks each tool call against the policy and answers deny or ask. It fails closed, so an error blocks the call instead of letting it through.
@@ -137,6 +137,36 @@ uv run agentctl check plugin/policy.example.json --tenant claude-code --tool Rea
 - **check** runs one call through a policy file and prints `allow`, `deny` or `ask` with the rule. Exit codes are 0, 1 and 3. It needs no database and starts every call with a fresh state, so budgets and loop limits are not exercised. Put arguments in a file with `--args @args.json` if shell quoting gets in the way.
 - Exit 2 means the command itself failed (bad input, no database), not that the log is bad. The database comes only from `PORTCULLIS_DATABASE_URL`, over a read-only connection, so the tool cannot change the log it inspects. Errors never print the URL.
 
+## Server
+
+An HTTP service for agent runtimes that are not Python or not LangGraph. Run it with `uv sync --extra server`, then `python -m portcullis.server` (loopback only by default; `--port` to change it).
+
+```bash
+uv run agentctl keygen --tenant acme --role agent --name runtime-1      # prints the key once, plus the entry to store
+uv run agentctl keygen --tenant acme --role approver --name alice
+# put the printed entries in a key file: {"keys": [ ... ]}, then set:
+#   PORTCULLIS_POLICY=policy.json  PORTCULLIS_KEYS=keys.json  PORTCULLIS_DATABASE_URL=...  (all required, no defaults)
+```
+
+| Call (Bearer key) | Role | What it does |
+|---|---|---|
+| `POST /v1/runs/{run}/calls` `{call_id, tool, args, definition_sha256?}` | agent | Decide one tool call: `allowed`, `denied` or `pending_approval`, with the rule. Repeating the same call returns the same answer. |
+| `GET /v1/runs/{run}/calls/{call_id}` | either | Status: also `approved` or `approval_denied` once answered. |
+| `POST /v1/runs/{run}/calls/{call_id}/approval` `{approved}` | approver | Answer a pending call. The approver's name comes from the key, not the request. |
+| `GET /v1/approvals?limit=&offset=` | approver | Calls of your tenant waiting for an answer, oldest first, up to 100 per page. |
+| `GET /v1/runs/{run}/audit` | either | The run's rows and whether its chain verifies. |
+| `GET /healthz` | none | Database reachable. |
+
+- **The tenant comes from the key.** A request body with any extra field, such as a `tenant_id`, is refused. Run names are namespaced by tenant, so tenants cannot see or answer each other's runs. An `agent` key cannot approve and an `approver` key cannot ask for decisions.
+- **State lives in the audit log.** Steps, loop history and spend are rebuilt from the run's own chain on every request, after verifying it. A chain that does not verify stops the run with a 503 instead of a decision. Requests for one run are serialized with a database lock, so concurrent calls cannot overshoot the step budget or the spend cap (a test races eight at once).
+- **Authentication comes first.** A request without a valid key is refused with 401 before its body is read. A tenant may have only a few requests in flight at once (more get 429 with `Retry-After`), so one tenant cannot use up the database connections.
+- **Fail closed.** Any failure is a non-2xx answer; a runtime must treat anything except `allowed` or `approved` as a refusal. A denied call is still HTTP 200 with the verdict in the body. A halted run (budget, loop, unknown tenant) is answered `run_halted` without writing more rows.
+- **`call_id` must come from your runtime, never from model output.** Repeating a call id returns the stored answer without counting as a step or as spend, so retries after a network failure are free. That also means anyone who can pick the id can replay an `allowed` answer for free (a test pins this). A retry must repeat the identical request, including the definition hash, or it is a 409. Use a counter or a uuid. There is no "executed" call yet to mark an answer as used up.
+- **Approvals re-check the cap, and a halted run cannot be approved.** Spend is counted when a call is allowed or approved, not when the caller reports it ran, so it can only over-count. An approval that no longer fits the cap, or that arrives after the run was halted, is recorded as denied with `blocked_by: spend_cap_exceeded` or `run_halted`.
+- **The approver does not see the arguments.** The server keeps only a hash of them (they may be sensitive). `GET /v1/approvals` returns `request_sha256`, so an approval tool must get the arguments from the runtime and check them against that hash. A pending queue can be filled by a hijacked agent; page through it and watch its size.
+- **Not enforced by the server:** the token and time budgets (it never sees model tokens or time), and what the tool does after an `allowed`. Do not show the `reason` to the model. Plain HTTP: put TLS in front before exposing it. The policy and key files are read once at startup. There is no rate limit on creating runs.
+- Read a server run with `agentctl verify RUN --tenant acme --rows N --head HASH`.
+
 ## Research question
 
 MCP servers, CLI plus skills, and code execution are three common ways to give an agent tools. The plan is to expose the same tools all three ways under one policy layer and measure, on the demo agent: pass^k, tokens, tool calls, latency, cost and attacks blocked. **No results exist yet.** Numbers will be published only after they are measured.
@@ -173,11 +203,11 @@ Teams that run agents with real side effects and need control and evidence: mult
 
 ## Stack
 
-Python 3.12, uv, LangGraph, Postgres (Docker), FastAPI, Pydantic v2, SQLAlchemy 2, Alembic, OpenTelemetry, pytest, Hypothesis, GitHub Actions. Dashboard in Next.js. Everything runs locally and needs no paid service.
+In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, Pydantic v2, pytest, GitHub Actions. Planned: a Next.js dashboard, OpenTelemetry, Hypothesis. Everything runs locally and needs no paid service.
 
 ## Roadmap
 
-1. Policy engine, fake LLM, tests (done; server around the engine still to do)
+1. Policy engine, fake LLM, tests, HTTP server (done)
 2. LangGraph integration, checkpoint and resume, approvals, budgets
 3. Hash-chained audit log (done), dashboard
 4. MCP surface, CLI and skill, code sandbox
@@ -193,8 +223,8 @@ Requires [uv](https://docs.astral.sh/uv/) and Docker (Docker is needed once the 
 ```bash
 git clone https://github.com/manas-vamsi/portcullis.git
 cd portcullis
-uv sync
-uv run pytest        # unit tests, no database needed
+uv sync --all-extras   # --all-extras adds the HTTP server's dependencies
+uv run pytest           # unit tests, no database needed
 ```
 
 The Postgres tests (checkpoint and kill-and-resume) need the database container:
