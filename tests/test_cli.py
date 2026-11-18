@@ -7,7 +7,8 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from portcullis.audit import append
+from portcullis.audit import append, namespaced
+from portcullis.keys import authenticate, hash_key
 from portcullis.cli import connect, main
 
 EXAMPLE_POLICY = Path(__file__).parent.parent / "plugin" / "policy.example.json"
@@ -58,6 +59,18 @@ def test_verify_treats_an_empty_run_as_a_failure_unless_zero_rows_is_expected(ru
     assert main(["verify", run_id], env) == 1
     assert "no rows" in capsys.readouterr().out
     assert main(["verify", run_id, "--rows", "0"], env) == 0
+
+
+def test_verify_and_show_read_a_server_run_with_tenant(conn, run_id, env, capsys):
+    server_run = namespaced("acme", run_id)
+    try:
+        append(conn, server_run, "acme", "c1:decision", "decision", {"call_id": "c1"})
+        assert main(["verify", run_id, "--tenant", "acme", "--rows", "1"], env) == 0
+        assert main(["verify", run_id], env) == 1  # without the tenant that run name does not exist
+        assert main(["show", run_id, "--tenant", "acme"], env) == 0
+        assert '"event_id": "c1:decision"' in capsys.readouterr().out
+    finally:
+        conn.execute("DELETE FROM audit_log WHERE run_id = %s", (server_run,))
 
 
 # --- show ---
@@ -185,6 +198,36 @@ def test_check_gives_the_same_verdict_as_the_hook(tool, args, capsys):
     hook_verdict = "deny" if code == 2 else "ask" if out else "allow"
     check(tool, args)
     assert capsys.readouterr().out.startswith(hook_verdict)
+
+
+# --- keygen ---
+
+
+def test_keygen_prints_the_key_once_and_the_entry_that_stores_only_its_hash(capsys):
+    assert main(["keygen", "--tenant", "acme", "--role", "approver", "--name", "alice"], {}) == 0
+    out = capsys.readouterr().out
+    key = next(w for w in out.split() if w.startswith("pc_"))
+    entry = json.loads(next(line for line in out.splitlines() if line.startswith("{")))
+    assert entry == {"sha256": hash_key(key), "tenant": "acme", "role": "approver", "name": "alice"}
+    assert key not in json.dumps(entry)
+    from portcullis.keys import KeyEntry
+
+    assert authenticate([KeyEntry(**entry)], key).role == "approver"
+
+
+def test_keygen_makes_a_different_key_every_time(capsys):
+    outs = []
+    for _ in range(2):
+        main(["keygen", "--tenant", "acme", "--role", "agent", "--name", "r"], {})
+        outs.append(capsys.readouterr().out)
+    assert outs[0] != outs[1]
+
+
+@pytest.mark.parametrize("extra", [["--role", "admin"], ["--name", "bad name"], ["--tenant", ""]])
+def test_keygen_rejects_a_bad_role_name_or_tenant(extra, capsys):
+    argv = {"--tenant": "acme", "--role": "agent", "--name": "ok"} | dict(zip(extra[::2], extra[1::2]))
+    assert main(["keygen", *[x for kv in argv.items() for x in kv]], {}) == 2
+    capsys.readouterr()
 
 
 # --- usage and wiring ---

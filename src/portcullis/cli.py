@@ -4,6 +4,9 @@
   agentctl show RUN_ID                              one JSON object per row, then the chain status
   agentctl check POLICY --tenant T --tool NAME      exit 0 allow, 1 deny, 3 ask (no database needed)
                 [--args JSON | --args @file]
+  agentctl keygen --tenant T --role agent|approver --name N   make a server API key (no database needed)
+
+verify and show take --tenant to read a run that was made through the server.
 
 Exit 2 means the command itself failed (bad input, no database), not that anything is wrong with the log.
 
@@ -23,9 +26,11 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from pydantic import ValidationError
 
-from portcullis.audit import GENESIS, events, require_project_database, verify
+from portcullis.audit import GENESIS, events, namespaced, payload_data, require_project_database, verify
 from portcullis.hook import HookError, load_policy
+from portcullis.keys import KeyEntry, hash_key, new_key
 from portcullis.policy import RunState, ToolCall, Verdict, decide
 
 EXIT_OK, EXIT_FAIL, EXIT_ERROR, EXIT_ASK = 0, 1, 2, 3
@@ -49,9 +54,14 @@ def connect(env: Mapping[str, str]) -> psycopg.Connection:
         raise CliError(f"cannot connect to the database ({type(exc).__name__})") from exc
 
 
+def _run(args: argparse.Namespace) -> str:
+    """The run name in the log: a server run is stored under its tenant, so --tenant names it."""
+    return namespaced(args.tenant, args.run_id) if args.tenant else args.run_id
+
+
 def _verify(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     with connect(env) as conn:
-        result = verify(conn, args.run_id)
+        result = verify(conn, _run(args))
     if not result.ok:
         print(f"BROKEN: {result.problem}")
         return EXIT_FAIL
@@ -68,20 +78,13 @@ def _verify(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     return EXIT_OK
 
 
-def _payload(text: str) -> Any:
-    try:
-        return json.loads(text)
-    except ValueError:  # a tampered row may not be JSON; show it as it is
-        return text
-
-
 def _show(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     with connect(env) as conn:
-        rows = events(conn, args.run_id)
-        result = verify(conn, args.run_id)
+        rows = events(conn, _run(args))
+        result = verify(conn, _run(args))
     for row in rows:
         # json.dumps escapes control characters, so a logged value cannot inject terminal escapes
-        print(json.dumps({**row, "payload": _payload(row["payload"])}))
+        print(json.dumps({**row, "payload": payload_data(row["payload"])}))
     if result.ok:
         print(f"chain: OK, {result.rows} rows, head {result.head if result.rows else GENESIS}")
         return EXIT_OK
@@ -113,19 +116,39 @@ def _check(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     return {Verdict.ALLOW: EXIT_OK, Verdict.DENY: EXIT_FAIL, Verdict.ASK: EXIT_ASK}[decision.verdict]
 
 
+def _keygen(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    key = new_key()
+    try:
+        entry = KeyEntry(sha256=hash_key(key), tenant=args.tenant, role=args.role, name=args.name)
+    except ValidationError as exc:
+        raise CliError("invalid tenant, role or name (a name is letters, digits, . _ - and at most 64 characters)") from exc
+    print(f"API key (shown once; keep it in a secret manager): {key}")
+    print('Add this entry to the "keys" list of your key file (it holds only the hash):')
+    print(entry.model_dump_json())
+    return EXIT_OK
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentctl", description="Inspect portcullis audit logs and policies.")
     commands = parser.add_subparsers(dest="command", required=True)
 
     verify_cmd = commands.add_parser("verify", help="check a run's hash chain")
     verify_cmd.add_argument("run_id")
+    verify_cmd.add_argument("--tenant", help="the tenant, for a run made through the server")
     verify_cmd.add_argument("--rows", type=int, help="expected number of rows, from a copy kept elsewhere")
     verify_cmd.add_argument("--head", help="expected hash of the last row, from a copy kept elsewhere")
     verify_cmd.set_defaults(run=_verify)
 
     show_cmd = commands.add_parser("show", help="print a run's rows, then its chain status")
     show_cmd.add_argument("run_id")
+    show_cmd.add_argument("--tenant", help="the tenant, for a run made through the server")
     show_cmd.set_defaults(run=_show)
+
+    keygen_cmd = commands.add_parser("keygen", help="make an API key for the server")
+    keygen_cmd.add_argument("--tenant", required=True)
+    keygen_cmd.add_argument("--role", required=True, choices=["agent", "approver"])
+    keygen_cmd.add_argument("--name", required=True, help="who the key belongs to; recorded as the approver")
+    keygen_cmd.set_defaults(run=_keygen)
 
     check_cmd = commands.add_parser("check", help="ask a policy what it would do with one call")
     check_cmd.add_argument("policy", help="path to a policy JSON file")
