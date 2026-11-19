@@ -25,6 +25,13 @@ TEST_EFFECTS_SETUP = (
 )
 
 
+class MaskedUrl(str):
+    """The database URL as a string that never shows itself, so a failing test cannot print the password."""
+
+    def __repr__(self) -> str:
+        return "'<database url>'"
+
+
 @pytest.fixture(scope="session")
 def postgres_url() -> str:
     from portcullis.audit import create_audit_log
@@ -44,7 +51,7 @@ def postgres_url() -> str:
         create_audit_log(conn)
         for statement in TEST_EFFECTS_SETUP:
             conn.execute(statement)
-    return url
+    return MaskedUrl(url)
 
 
 @pytest.fixture
