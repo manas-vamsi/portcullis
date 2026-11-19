@@ -6,7 +6,13 @@
 
 Portcullis sits in front of an agent's tools and decides, with plain deterministic rules, what the agent is allowed to do. It can allow a call, block it, or pause it until a human approves. Every decision is written to a tamper-evident audit log.
 
-> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The attack suite runs scripted-model attacks against the policy. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). An OpenAI-compatible model adapter and an eval harness are built (no real model has been run through them yet, so no results exist). A first HTTP server is built (authenticated decisions, human approvals and the audit trail). A small dashboard (approvals, audit log, eval report) is served by the server. A feature is marked as built only when it has tests behind it; everything else is design.
+> **Status: a working, tested core. Not production software, and not yet measured with a real model.**
+>
+> **Built, each with tests behind it:** the deterministic policy engine (allow, deny or ask; allowlists, argument rules, amounts, budgets, loop detection, per-run and per-tenant daily spend caps, tool-definition pinning); a guarded LangGraph agent loop with human approval, an idempotency ledger and crash recovery; a hash-chained audit log; an HTTP server with API keys, approver roles and hot-reloaded policy; a dashboard; a Claude Code hook; a proxy that puts the policy in front of any MCP server; a portable skill file; the `agentctl` CLI; an attack suite; an eval harness with an OpenAI-compatible model adapter; benchmarks and decision records.
+>
+> **Not built, or not done:** no real model has been run through the eval harness, so there are **no results** to quote; OpenTelemetry tracing; a code sandbox; the three-surface (MCP, CLI, library) comparison; a faster Claude Code hook (it adds about 0.7 to 1.0 seconds a call); a cache for the server's per-run state (it slows as a run grows); the dashboard and the MCP proxy have not been tried in a real browser or with a third-party MCP client.
+>
+> A feature is marked as built only when it has tests behind it. Numbers appear only when they were measured, and weaknesses are written down (see "Known limits") and pinned by tests.
 
 ---
 
@@ -30,7 +36,7 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 | Capability | What it means | Status |
 |---|---|---|
 | Tool allowlists and risk levels | Per-tenant rules; each tool is `read`, `write` or `irreversible` | Built (policy engine) |
-| Human approval | Irreversible actions and spend above a threshold wait for an explicit approve or deny | Built in the LangGraph agent loop (pauses with `interrupt`, only a named explicit approval counts, the approver is recorded in state and never shown to the model); approval UI planned |
+| Human approval | Irreversible actions and spend above a threshold wait for an explicit approve or deny | Built in the LangGraph agent loop (pauses with `interrupt`, only a named explicit approval counts, the approver is recorded in state and never shown to the model). Also built: the server's approvals with a page in the dashboard, and approval through the MCP proxy |
 | Tamper-evident audit log | Hash-chained records of every decision, who approved or denied what, and what ran | Built (one chain per run in Postgres, wired into the agent loop); read and verify with `agentctl` or in the dashboard |
 | Budgets and loop detection | Limits on steps, tokens and time, enforced by the runtime, plus an optional cap on the total amount spent in a run | Built in the LangGraph agent loop; a breach of steps, tokens, time or loops halts the run, and a call that would pass the spend cap is refused while the run carries on |
 | Idempotency keys | A crash and resume does not repeat a side effect | Built (Postgres ledger), wired into the LangGraph agent loop |
@@ -64,7 +70,7 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 
 The same policy engine is reached through several entry points, so the rules are written once and apply everywhere.
 
-## Ways to use it (planned)
+## Ways to use it
 
 1. **Python library**: a guarded LangGraph agent loop where every tool call goes through the policy, approval and ledger (first version built; see `src/portcullis/agent.py`).
 2. **Server** (first version built, see below): a FastAPI service where an agent runtime asks before each tool call, a human approves or denies the pending ones, and everything lands in the Postgres audit log.
@@ -140,7 +146,7 @@ Point the MCP client at the second command. The proxy starts the real server its
 |---|---|---|
 | Prompt injection in a tool result | The injected text reaches the model; calls to tools off the allowlist are refused and never run. A call that claims `approved: true` still waits for a human, and only a named explicit answer approves. A repeat loop is halted. A secret sent through an allowed tool waits for approval. Spend disguised as a string, a bool, a negative or NaN is refused. | Five orders of 499 (each under the $500 approval line) are stopped at the fifth by a `max_spend` cap of 2000. **The cap is per run:** a second run starts at zero, so two runs can spend 3992. Without a cap, all five go through. |
 | Poisoned tool description | A model that obeys a poisoned description still cannot call unlisted tools. A description changed after review is refused by its pin. | **A description that was already poisoned when you pinned it passes the pin.** Review the text before pinning. |
-| Rug pull (definition changes later) | A definition that changes mid-run is refused from the next call. One that changes while a call waits for approval stops the call. | Definitions come from a function you supply; reading them from a real MCP server is not built. |
+| Rug pull (definition changes later) | A definition that changes mid-run is refused from the next call. One that changes while a call waits for approval stops the call. | In the library loop, definitions come from a function you supply; the MCP proxy reads them from a real MCP server (tested in memory and over stdio). |
 | Confused deputy | The acting tenant comes from the caller, so a model naming another tenant gains nothing. A work order for another tenant's vendor is refused, including with a newline, a leading space, a list or a missing id. | **The policy checks the text of an id, not who owns it.** The tool's own backend must check ownership too. |
 
 Tests named `test_known_gap__...` pin the weaknesses above so they cannot change or be forgotten silently. Run it with `uv run --env-file .env pytest tests/test_attacks.py -v` (it needs the Postgres container). Claude Code hook attacks (editing the policy, `.env` evasions, hook failures) are covered in `tests/test_hook_policy.py`, and a cross-tenant replay of the idempotency ledger in `tests/test_agent.py`.
@@ -283,39 +289,50 @@ In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, 
 
 ## Roadmap
 
-1. Policy engine, fake LLM, tests, HTTP server (done)
-2. LangGraph integration, checkpoint and resume, approvals, budgets
-3. Hash-chained audit log and dashboard (done)
-4. MCP proxy, CLI and skill (done); code sandbox (not built)
-5. Eval gate (harness built; waiting for a first real run), three-surface comparison
-6. Claude Code plugin and demo
-7. Executable attack suite (done: see "Attack suite"; it also lists the gaps it found)
-8. Benchmarks (done: see "Measured costs"; no model is involved), architecture decision records (done), docs
+Done: the policy engine; the guarded LangGraph loop with approvals, budgets, checkpoint and resume; the audit log and the dashboard; the HTTP server; the Claude Code plugin hook; the MCP proxy, CLI and skill; the executable attack suite; the eval harness; benchmarks; decision records.
+
+Not done:
+
+1. A first real-model run of the evals (needs a model endpoint; the harness and adapter are ready), then publishing the numbers with the model name, run count and case-file hash.
+2. A faster Claude Code hook (a long-running process, or an implementation that starts faster).
+3. A cache for the server's per-run state, without weakening the chain check.
+4. OpenTelemetry tracing.
+5. A code sandbox, and the three-surface comparison (MCP, CLI, library) on the demo agent. The comparison needs a real model.
+6. Trying the dashboard in real browsers and the MCP proxy with real clients.
 
 ## Getting started
 
-Requires [uv](https://docs.astral.sh/uv/) and Docker (Docker is needed once the Postgres service lands).
+Requires [uv](https://docs.astral.sh/uv/) and Docker (for the Postgres container). Node is optional: if it is installed, the dashboard's logic tests run.
 
 ```bash
 git clone https://github.com/manas-vamsi/portcullis.git
 cd portcullis
-uv sync --all-extras   # --all-extras adds the HTTP server's dependencies
-uv run pytest           # unit tests, no database needed
+uv sync --all-extras   # --all-extras adds the HTTP server's and the MCP proxy's dependencies
+uv run pytest          # the tests that need no database (the Postgres tests are skipped without .env)
 ```
 
-The Postgres tests (checkpoint and kill-and-resume) need the database container:
+The Postgres tests, the demo, the server and the benchmarks need the database container:
 
 ```bash
 cp .env.example .env     # then put the same real password in both lines
 docker compose up -d --wait
 uv run --env-file .env pytest
-uv run --env-file .env python -m portcullis.demo                      # all five demo scenarios
-uv run --env-file .env python -m portcullis.demo --scenario expensive  # one of them
 ```
 
-The container listens on `127.0.0.1:5433` only. Without `.env`, the Postgres tests are skipped. The test setup refuses to run against any database whose name does not start with `portcullis`.
+The container listens on `127.0.0.1:5433` only. The test setup, the demo, the server and the benchmarks all refuse a database whose name does not start with `portcullis`.
 
-Run `uv run agentctl --help` for the CLI. The test suite and the demo are the main things to run so far. This section will grow with the code.
+| To do this | Run |
+|---|---|
+| See the guarded agent on five synthetic scenarios | `uv run --env-file .env python -m portcullis.demo` |
+| Check one call against a policy | `uv run agentctl check plugin/policy.example.json --tenant claude-code --tool Read --args '{"file_path": ".env"}'` |
+| Verify or read an audit chain | `uv run --env-file .env agentctl verify RUN_ID` and `agentctl show RUN_ID` |
+| Run the server and open the dashboard | see "Server" (`agentctl keygen`, then `python -m portcullis.server`, then `/dashboard/`) |
+| Govern an MCP server | see "MCP proxy" (`python -m portcullis.mcp_proxy pin ...` then `serve ...`) |
+| Use the Claude Code plugin | see "Claude Code plugin" |
+| Run the evals against a model | see "Evals" |
+| Measure costs on your machine | `uv run --env-file .env python benchmarks/run.py` |
+
+Everything runs locally and costs nothing.
 
 ## Data and licensing notes
 
