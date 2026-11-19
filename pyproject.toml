@@ -5,6 +5,7 @@ description = "Deterministic policy, approval and audit layer between AI agents 
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
+    "httpx>=0.28",
     "langgraph>=1.2.20",
     "langgraph-checkpoint-postgres>=3.2.0",
     "psycopg[binary,pool]>=3.3.8",

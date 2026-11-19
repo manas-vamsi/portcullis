@@ -708,6 +708,7 @@ name = "portcullis"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-postgres" },
     { name = "psycopg", extra = ["binary", "pool"] },
@@ -729,6 +730,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.163.2" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "langgraph", specifier = ">=1.2.20" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.2.0" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.8" },
