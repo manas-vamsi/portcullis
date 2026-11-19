@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Portcullis</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Portcullis</h1>
+    <form id="key-form" autocomplete="off">
+      <label for="key">API key</label>
+      <input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="pc_…">
+      <span id="key-note" class="note">Kept in this tab's memory only. Use an approver key to answer approvals.</span>
+    </form>
+    <nav aria-label="Pages">
+      <button type="button" data-tab="approvals" aria-pressed="true">Approvals</button>
+      <button type="button" data-tab="audit" aria-pressed="false">Audit log</button>
+      <button type="button" data-tab="evals" aria-pressed="false">Eval report</button>
+    </nav>
+  </header>
+
+  <main>
+    <p id="message" role="status" aria-live="polite"></p>
+
+    <section id="approvals">
+      <h2>Waiting for a human</h2>
+      <p class="note">What the model asked for, as text. Check it before you approve: it is untrusted.</p>
+      <div class="row">
+        <button type="button" id="load-pending">Refresh</button>
+        <label><input type="checkbox" id="auto"> refresh every 10 seconds</label>
+      </div>
+      <div id="pending"></div>
+    </section>
+
+    <section id="audit" hidden>
+      <h2>Audit log</h2>
+      <form id="audit-form" class="row">
+        <label for="run">Run</label>
+        <input id="run" type="text" autocomplete="off" spellcheck="false" placeholder="run id" required>
+        <button type="submit">Show</button>
+      </form>
+      <div id="audit-result"></div>
+    </section>
+
+    <section id="evals" hidden>
+      <h2>Eval report</h2>
+      <p class="note">Open a results file made by <code>python -m portcullis.evals run --out results.json</code>. The numbers are recomputed here from the runs in the file. They describe one model on a few synthetic cases, not a benchmark. To gate a release use <code>evals gate</code>.</p>
+      <input id="results-file" type="file" accept="application/json,.json">
+      <div id="eval-result"></div>
+    </section>
+  </main>
+</body>
+</html>

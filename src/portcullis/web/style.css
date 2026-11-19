@@ -1,0 +1,31 @@
+:root {
+  --bg: #fbfbfa; --fg: #1d1f21; --muted: #5f6368; --line: #d9d9d4; --panel: #ffffff;
+  --ok: #17692b; --bad: #a4262c; --wait: #8a5a00; --accent: #1f4fb4;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #16181a; --fg: #e8e8e6; --muted: #a0a4a8; --line: #34383c; --panel: #1e2124;
+          --ok: #5fd07a; --bad: #ff7b7f; --wait: #e8b34a; --accent: #8db1ff; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+header, main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+h1 { margin: 0 0 8px; font-size: 1.4rem; }
+h2 { font-size: 1.1rem; }
+label { margin-right: 6px; }
+input[type="password"], input[type="text"] { padding: 6px 8px; min-width: 16rem; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--panel); color: var(--fg); }
+button { padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+button.ok { border-color: var(--ok); color: var(--ok); }
+button.bad { border-color: var(--bad); color: var(--bad); }
+nav { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+nav button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+.note { color: var(--muted); font-size: .9rem; }
+p.ok, td.ok { color: var(--ok); } p.bad, td.bad { color: var(--bad); }
+#message.error { color: var(--bad); font-weight: 600; }
+table { width: 100%; border-collapse: collapse; background: var(--panel); margin: 8px 0 16px; }
+th, td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+th { font-weight: 600; }
+pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.4 ui-monospace, monospace; max-height: 14rem; overflow: auto; }
+@media (max-width: 640px) { input[type="password"], input[type="text"] { min-width: 0; width: 100%; } }

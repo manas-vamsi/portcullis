@@ -40,6 +40,8 @@ Trust and limits
   from the runtime, never from model output.
 - Plain HTTP on loopback by default: put TLS in front of it. The new-run limit is kept in memory,
   per process.
+- The dashboard (dashboard.py) is served at /dashboard/ and holds no data of its own: it calls this API
+  with the key you type, and shows everything from the log as text only.
 """
 
 import argparse
@@ -71,6 +73,7 @@ from portcullis.audit import (
     require_project_database,
     verify,
 )
+from portcullis import dashboard
 from portcullis.hook import HookError, load_policy
 from portcullis.jsondata import MAX_INT, check_json
 from portcullis.keys import KeyEntry, Principal, authenticate, load_keys
@@ -572,6 +575,7 @@ def create_app(
     def run_audit(run_id: str = name(), who: Principal = Depends(either), gw: Gateway = Depends(gateway)):
         return gw.audit(who.tenant, run_id)
 
+    dashboard.mount(app)
     return app
 
 
