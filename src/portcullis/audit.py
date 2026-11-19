@@ -63,6 +63,17 @@ def namespaced(tenant: str, run_id: str) -> str:
     return json.dumps([tenant, run_id])
 
 
+def hook_run(tenant: str, session: str) -> str:
+    """The run name the Claude Code hook uses. Three parts, so it can never be mistaken for a server run
+    (two parts), and the server's approval queue never lists the hook's unanswered asks."""
+    return json.dumps(["claude-code-hook", tenant, session])
+
+
+def lock_key(name: str) -> int:
+    """A 64-bit advisory lock number for a run: a sha256 prefix, so a client cannot guess or collide it."""
+    return int.from_bytes(hashlib.sha256(f"run:{name}".encode()).digest()[:8], "big", signed=True)
+
+
 def require_project_database(url: str) -> None:
     """Refuse a database not named for this project, in case a URL points at someone else's."""
     if not urlparse(url).path.lstrip("/").startswith("portcullis"):

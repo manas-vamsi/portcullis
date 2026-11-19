@@ -18,6 +18,7 @@ from portcullis.policy import (
     decide,
     definition_hash,
     fingerprint,
+    is_sensitive,
     spend_amount,
 )
 
@@ -478,3 +479,67 @@ def test_spend_amount_is_what_a_call_would_spend_and_zero_when_there_is_nothing_
     assert spend_amount(pol, call("check_vendor")) == 0
     assert spend_amount(pol, call("nope")) == 0
     assert spend_amount(pol, call("create_work_order", tenant="nobody", args={"cost": 5})) == 0
+
+
+# --- per-tenant daily spend cap ---
+
+
+def daily(per_day=1000, per_run=None) -> Policy:
+    budget = BUDGET.model_copy(update={"max_spend": per_run, "max_spend_per_day": per_day})
+    tools = {"create_work_order": ToolRule(risk=Risk.WRITE, approve_above=Threshold(arg="cost", limit=500))}
+    return Policy(tenants={"acme": TenantPolicy(budget=budget, tools=tools)})
+
+
+def daily_decision(cost, tenant_spend, **caps):
+    return decide(daily(**caps), call("create_work_order", args={"cost": cost}), RunState(tenant_spend=tenant_spend))
+
+
+def test_a_call_within_the_daily_cap_is_allowed_and_one_that_reaches_it_exactly_too():
+    assert daily_decision(300, tenant_spend=600).verdict is Verdict.ALLOW
+    assert daily_decision(400, tenant_spend=600).verdict is Verdict.ALLOW
+
+
+def test_a_call_that_would_pass_the_daily_cap_is_denied_even_in_a_brand_new_run():
+    decision = daily_decision(401, tenant_spend=600)  # the run itself has spent nothing
+    assert (decision.verdict, decision.rule) == (Verdict.DENY, "tenant_spend_cap_exceeded")
+
+
+def test_the_daily_cap_beats_the_approval_threshold():
+    assert daily_decision(900, tenant_spend=500).rule == "tenant_spend_cap_exceeded"
+    assert daily_decision(900, tenant_spend=0).rule == "approval_required"
+
+
+def test_the_run_cap_is_checked_first_when_both_are_exceeded():
+    decision = daily_decision(900, tenant_spend=500, per_run=100)
+    assert decision.rule == "spend_cap_exceeded"
+
+
+def test_without_a_daily_cap_the_tenants_spend_is_not_limited():
+    assert daily_decision(499, tenant_spend=10**9, per_day=None).verdict is Verdict.ALLOW
+
+
+@pytest.mark.parametrize("cap", [-1, math.nan, math.inf])
+def test_a_daily_cap_must_be_a_finite_non_negative_number(cap):
+    with pytest.raises(ValidationError):
+        Budget(**{**BUDGET.model_dump(), "max_spend_per_day": cap})
+
+
+@pytest.mark.parametrize("spend", [-1, math.nan, math.inf])
+def test_the_tenant_spend_in_the_run_state_must_be_finite_and_non_negative(spend):
+    with pytest.raises(ValidationError):
+        RunState(tenant_spend=spend)
+
+
+def test_a_call_is_sensitive_when_any_ask_pattern_matches_even_if_another_rule_decided_it_first():
+    tools = {
+        "rotate": ToolRule(risk=Risk.IRREVERSIBLE, ask_if=(ArgPattern(arg="password", regex=r"\S"),)),
+        "plain": ToolRule(risk=Risk.READ),
+    }
+    policy = Policy(tenants={"acme": TenantPolicy(budget=BUDGET, tools=tools)})
+    secret = call("rotate", args={"password": "hunter2"})
+    assert decide(policy, secret, RunState()).rule == "irreversible_action"  # not "sensitive_argument"...
+    assert is_sensitive(policy, secret)  # ...but the secret is still recognised
+    assert not is_sensitive(policy, call("rotate", args={"password": ""}))
+    assert not is_sensitive(policy, call("plain", args={"password": "x"}))
+    assert not is_sensitive(policy, call("nope"))
+    assert not is_sensitive(policy, call("plain", tenant="nobody"))

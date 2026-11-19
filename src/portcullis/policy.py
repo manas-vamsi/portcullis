@@ -88,6 +88,10 @@ class Budget(_Frozen):
     # approve_above threshold. None means no cap. A human approval cannot exceed it. Per run, not per
     # tenant or per day: a new run starts at zero.
     max_spend: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    # Cap on what one tenant spends across ALL its runs in a rolling 24 hours, so starting a new run does not
+    # reset it. Only the server tracks this (it needs a place that sees every run); the library agent loop and
+    # the hook do not, and treat the tenant's spend as zero. None means no cap.
+    max_spend_per_day: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class TenantPolicy(_Frozen):
@@ -113,6 +117,7 @@ class RunState(_Frozen):
     seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
     history: tuple[str, ...] = ()  # fingerprints of calls already made in this run
     spend: float = Field(default=0, ge=0, allow_inf_nan=False)  # total amount of the calls that already ran
+    tenant_spend: float = Field(default=0, ge=0, allow_inf_nan=False)  # the tenant's spend over the last 24 hours
 
 
 class Decision(_Frozen):
@@ -192,16 +197,29 @@ def _check_amount(rule: ToolRule, call: ToolCall) -> Decision | None:
 
 def _check_spend(budget: Budget, rule: ToolRule, call: ToolCall, state: RunState) -> Decision | None:
     threshold = rule.approve_above
-    if budget.max_spend is None or threshold is None:
+    if threshold is None:
         return None
     amount = call.args[threshold.arg]  # validated by _check_amount
-    if state.spend + amount <= budget.max_spend:
-        return None
-    return _decision(
-        Verdict.DENY,
-        "spend_cap_exceeded",
-        f"spend so far {state.spend} plus {amount} would pass the run's cap of {budget.max_spend}",
-    )
+    if budget.max_spend is not None and state.spend + amount > budget.max_spend:
+        return _decision(
+            Verdict.DENY,
+            "spend_cap_exceeded",
+            f"spend so far {state.spend} plus {amount} would pass the run's cap of {budget.max_spend}",
+        )
+    if budget.max_spend_per_day is not None and state.tenant_spend + amount > budget.max_spend_per_day:
+        return _decision(
+            Verdict.DENY,
+            "tenant_spend_cap_exceeded",
+            f"the tenant's spend today {state.tenant_spend} plus {amount} would pass its daily cap of {budget.max_spend_per_day}",
+        )
+    return None
+
+
+def is_sensitive(policy: Policy, call: ToolCall) -> bool:
+    """Whether the call matches any of its tool's sensitive-argument patterns, even if another rule decided it first."""
+    tenant = policy.tenants.get(call.tenant_id)
+    rule = tenant.tools.get(call.tool) if tenant else None
+    return rule is not None and _first_match(rule.ask_if, call) is not None
 
 
 def spend_amount(policy: Policy, call: ToolCall) -> float:
