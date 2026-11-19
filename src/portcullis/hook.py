@@ -95,7 +95,7 @@ def _decide_and_record(env: Mapping[str, str], event: dict[str, Any], tenant: st
     # before every tool call, so callers who do not use a database should not pay for it.
     import psycopg
 
-    from portcullis.audit import append, create_audit_log, events, hook_run, lock_key, require_project_database, verify
+    from portcullis.audit import append, create_audit_log, hook_run, lock_key, read_verified, require_project_database
     from portcullis.runstate import fold, halted, run_state
 
     session = event.get("session_id")
@@ -113,9 +113,10 @@ def _decide_and_record(env: Mapping[str, str], event: dict[str, Any], tenant: st
         with psycopg.connect(url, autocommit=True, connect_timeout=5, options=DB_OPTIONS) as conn:
             create_audit_log(conn)
             conn.execute("SELECT pg_advisory_lock(%s)", (lock_key(run),))  # held until the connection closes
-            if not verify(conn, run).ok:
+            checked, rows = read_verified(conn, run)  # one fetch for both the check and the history
+            if not checked.ok:
                 raise HookError("the session's audit chain does not verify")
-            calls = fold(events(conn, run))
+            calls = fold(rows)
             known = calls.get(tool_use)
             if known:  # the same call again: the same answer, nothing new written
                 stored = known.decision

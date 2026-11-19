@@ -38,12 +38,14 @@ REQUIRED = {
 }
 
 
-def fold(rows: Sequence[Mapping[str, Any]]) -> dict[str, CallRecord]:
+def fold(rows: Sequence[Mapping[str, Any]], calls: dict[str, CallRecord] | None = None) -> dict[str, CallRecord]:
     """The run's calls in the order they were decided, with their answers.
+
+    Pass `calls` to extend what an earlier fold returned with rows that came after it (it is changed in place).
 
     Any row that is not shaped like the ones this code writes is InconsistentRun, never a KeyError or a
     TypeError, so a damaged or hostile row stops the run cleanly instead of crashing a request."""
-    calls: dict[str, CallRecord] = {}
+    calls = {} if calls is None else calls
     try:
         for row in rows:
             event = row["event"]

@@ -893,3 +893,24 @@ def test_the_ledger_keeps_the_larger_amount_for_a_call_and_forgets_old_rows(capp
     conn.execute("INSERT INTO spend_ledger (tenant, run_id, call_id, amount, ts) VALUES ('capped', %s, 'old', 1, now() - interval '49 hours')", (rid,))
     spend(capped, rid + "-2", "b0", 100)  # a capped call reads the tenant's total and tidies up
     assert conn.execute("SELECT count(*) FROM spend_ledger WHERE call_id = 'old'").fetchone()[0] == 0
+
+
+def test_a_tampered_row_is_still_caught_when_the_server_has_already_seen_that_history(gateway, conn, rid):
+    decide(gateway, rid, "c1", args={"n": 1})
+    decide(gateway, rid, "c2", args={"n": 2})  # the server now remembers this run's verified history
+    conn.execute(
+        "UPDATE audit_log SET payload = replace(payload, 'allow', 'deny') WHERE run_id = %s AND idx = 0", (namespaced("acme", rid),)
+    )
+    with pytest.raises(ChainBroken):
+        decide(gateway, rid, "c3", args={"n": 3})
+    assert gateway.audit("acme", rid)["verified"]["ok"] is False
+
+
+def test_later_requests_for_a_run_read_only_the_rows_added_since(gateway, rid, monkeypatch):
+    import portcullis.runcache as runcache
+
+    starts, real = [], runcache.fetch_rows
+    monkeypatch.setattr(runcache, "fetch_rows", lambda c, run, start=0: starts.append(start) or real(c, run, start))
+    for i in range(4):
+        decide(gateway, rid, f"c{i}", args={"n": i})
+    assert starts == [0, 0, 1, 2]  # the first found an empty run; each later one started after the rows it knew

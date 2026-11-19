@@ -10,7 +10,8 @@ Design points
   are refused). Run names are namespaced by tenant, so tenants cannot touch each other's runs.
 - Run state (steps, loop history, spend, tokens, elapsed time) is not kept anywhere else: it is
   folded from the run's own audit chain on every request (see runstate.py), and the chain is
-  verified first. A tampered chain stops the run (503) instead of producing a decision from
+  verified first. A reader (runcache.py) reuses what it verified last time only while the database
+  confirms, by a digest of every stored field, that the history is unchanged to the byte. A tampered chain stops the run (503) instead of producing a decision from
   corrupted state.
 - Requests for one run are serialized with a Postgres advisory lock, so concurrent calls cannot
   overshoot a budget or a spend cap.
@@ -66,12 +67,11 @@ from portcullis.audit import (
     AuditConflict,
     append,
     create_audit_log,
-    events,
     lock_key,
     namespaced,
     payload_data,
+    read_verified,
     require_project_database,
-    verify,
 )
 from portcullis import dashboard
 from portcullis.hook import HookError, load_policy
@@ -79,7 +79,8 @@ from portcullis.jsondata import MAX_INT, check_json
 from portcullis.keys import KeyEntry, Principal, authenticate, load_keys
 from portcullis.policy import Policy, ToolCall, Verdict, decide, fingerprint, is_sensitive, spend_amount
 from portcullis.reloadable import ConfigUnavailable, Reloadable
-from portcullis.runstate import CallRecord, InconsistentRun, fold, halted, run_state, spent, status, view
+from portcullis.runcache import ChainBroken, RunReader
+from portcullis.runstate import CallRecord, halted, run_state, spent, status, view
 
 MAX_BODY = 262_144  # bytes; larger requests are refused before they are read
 MAX_NAME = 128
@@ -114,10 +115,6 @@ class NotFound(Exception):
 
 class Busy(Exception):
     """The tenant already has its share of requests in flight, or is starting runs too fast."""
-
-
-class ChainBroken(Exception):
-    """The run's audit chain does not verify, so no decision can be made from it."""
 
 
 def open_pool(url: str) -> ConnectionPool:
@@ -164,6 +161,7 @@ class Gateway:
         self._new_runs: dict[str, deque[float]] = {}
         self._guard = threading.Lock()
         self._clock = clock
+        self._reader = RunReader()  # remembers verified history; see runcache.py
 
     @contextmanager
     def _slot(self, tenant: str):
@@ -237,12 +235,7 @@ class Gateway:
             )
 
     def _load(self, conn: psycopg.Connection, run: str) -> dict[str, CallRecord]:
-        if not verify(conn, run).ok:
-            raise ChainBroken(run)
-        try:
-            return fold(events(conn, run))
-        except InconsistentRun as exc:
-            raise ChainBroken(run) from exc
+        return self._reader.load(conn, run)  # verified, and only re-read when the stored history changed
 
     def decide_call(
         self,
@@ -400,7 +393,7 @@ class Gateway:
         self.config_ok()
         run = namespaced(tenant, run_id)
         with self._slot(tenant), self._pool.connection() as conn:
-            result, rows = verify(conn, run), events(conn, run)
+            result, rows = read_verified(conn, run)
         return {
             "verified": {"ok": result.ok, "rows": result.rows, "head": result.head, "problem": result.problem},
             "events": [{**row, "payload": payload_data(row["payload"])} for row in rows],

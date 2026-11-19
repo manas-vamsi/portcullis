@@ -19,6 +19,7 @@ anchors if cross-run deletion needs detecting.
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -125,6 +126,27 @@ def append(conn: psycopg.Connection, run_id: str, tenant_id: str, event_id: str,
     return row_hash
 
 
+ROW_COLUMNS = "idx, event_id, tenant_id, event, ts, payload, prev_hash, hash"
+EVENT_FIELDS = ("idx", "event_id", "tenant_id", "event", "ts", "payload")
+
+
+def fetch_rows(conn: psycopg.Connection, run_id: str, start: int = 0) -> list[tuple[Any, ...]]:
+    """A run's rows from position `start` on, as (idx, event_id, tenant_id, event, ts, payload, prev_hash, hash)."""
+    return conn.execute(
+        f"SELECT {ROW_COLUMNS} FROM audit_log WHERE run_id = %s AND idx >= %s ORDER BY idx", (run_id, start)
+    ).fetchall()
+
+
+def row_dicts(rows: Sequence[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    """Rows as the dicts `events()` returns (without the hashes)."""
+    return [dict(zip(EVENT_FIELDS, row)) for row in rows]
+
+
+def events(conn: psycopg.Connection, run_id: str) -> list[dict[str, Any]]:
+    """Every row of a run in order, as stored. Does not check the chain; call verify() for that."""
+    return row_dicts(fetch_rows(conn, run_id))
+
+
 def payload_data(text: str) -> Any:
     """A row's payload as data. A tampered row may not be JSON; it is then returned as the stored text."""
     try:
@@ -133,31 +155,56 @@ def payload_data(text: str) -> Any:
         return text
 
 
-def verify(conn: psycopg.Connection, run_id: str) -> Verification:
-    rows = conn.execute(
-        "SELECT idx, event_id, tenant_id, event, ts, payload, prev_hash, hash "
-        "FROM audit_log WHERE run_id = %s ORDER BY idx",
-        (run_id,),
-    ).fetchall()
-    prev = GENESIS
-    for position, (idx, event_id, tenant_id, event, ts, payload, prev_hash, stored) in enumerate(rows):
+def check_rows(run_id: str, rows: Sequence[tuple[Any, ...]], start_position: int = 0, prev: str = GENESIS) -> Verification:
+    """Check rows that start at `start_position` and chain onto `prev` (the previous row's hash).
+
+    The whole chain is start_position 0 and the genesis hash; to extend a chain already verified up to a
+    known head, pass where the new rows begin and that head."""
+    for offset, (idx, event_id, tenant_id, event, ts, payload, prev_hash, stored) in enumerate(rows):
+        position = start_position + offset
+        total = start_position + len(rows)
         if idx != position:
-            return Verification(False, len(rows), prev, f"row {position} is missing (next row is {idx})")
+            return Verification(False, total, prev, f"row {position} is missing (next row is {idx})")
         if prev_hash != prev:
-            return Verification(False, len(rows), prev, f"row {idx} does not follow the row before it")
+            return Verification(False, total, prev, f"row {idx} does not follow the row before it")
         if _row_hash(prev_hash, idx, run_id, tenant_id, event_id, event, ts, payload) != stored:
-            return Verification(False, len(rows), prev, f"row {idx} was changed")
+            return Verification(False, total, prev, f"row {idx} was changed")
         prev = stored
-    return Verification(True, len(rows), prev, None)
+    return Verification(True, start_position + len(rows), prev, None)
 
 
-def events(conn: psycopg.Connection, run_id: str) -> list[dict[str, Any]]:
-    """Every row of a run in order, as stored. Does not check the chain; call verify() for that."""
-    rows = conn.execute(
-        "SELECT idx, event_id, tenant_id, event, ts, payload FROM audit_log WHERE run_id = %s ORDER BY idx",
-        (run_id,),
-    ).fetchall()
-    return [dict(zip(("idx", "event_id", "tenant_id", "event", "ts", "payload"), row)) for row in rows]
+def verify(conn: psycopg.Connection, run_id: str) -> Verification:
+    return check_rows(run_id, fetch_rows(conn, run_id))
+
+
+def read_verified(conn: psycopg.Connection, run_id: str) -> tuple[Verification, list[dict[str, Any]]]:
+    """Verify a run and return its rows from a single fetch (calling verify() and events() reads them twice)."""
+    rows = fetch_rows(conn, run_id)
+    return check_rows(run_id, rows), row_dicts(rows)
+
+
+# A digest of every field of a row, computed by the database so the rows need not be sent to be compared.
+_ROW_DIGEST = (
+    "encode(sha256(convert_to(json_build_array(idx, event_id, tenant_id, event, ts, payload, prev_hash, hash)::text, 'UTF8')), 'hex')"
+)
+
+
+def history_checksums(conn: psycopg.Connection, run_id: str, prefix: int) -> tuple[int, str, int, str]:
+    """(rows, digest of all rows, rows before `prefix`, digest of those). Digests are '' for no rows.
+
+    A digest covers every stored field of every row, in order. If the digest of the first `prefix` rows is the
+    same as when they were last verified, those rows have not changed by a single byte, so they need not be
+    verified again."""
+    row = conn.execute(
+        f"WITH h AS (SELECT idx, {_ROW_DIGEST} AS d FROM audit_log WHERE run_id = %s) "
+        "SELECT count(*), "
+        "coalesce(encode(sha256(convert_to(string_agg(d, '' ORDER BY idx), 'UTF8')), 'hex'), ''), "
+        "count(*) FILTER (WHERE idx < %s), "
+        "coalesce(encode(sha256(convert_to(string_agg(d, '' ORDER BY idx) FILTER (WHERE idx < %s), 'UTF8')), 'hex'), '') "
+        "FROM h",
+        (run_id, prefix, prefix),
+    ).fetchone()
+    return int(row[0]), row[1], int(row[2]), row[3]
 
 
 @dataclass(frozen=True)
