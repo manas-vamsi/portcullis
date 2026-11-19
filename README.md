@@ -6,7 +6,7 @@
 
 Portcullis sits in front of an agent's tools and decides, with plain deterministic rules, what the agent is allowed to do. It can allow a call, block it, or pause it until a human approves. Every decision is written to a tamper-evident audit log.
 
-> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The attack suite runs scripted-model attacks against the policy. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). An OpenAI-compatible model adapter and an eval harness are built (no real model has been run through them yet, so no results exist). A first HTTP server is built (authenticated decisions, human approvals and the audit trail). The dashboard is not. A feature is marked as built only when it has tests behind it; everything else is design.
+> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The attack suite runs scripted-model attacks against the policy. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). An OpenAI-compatible model adapter and an eval harness are built (no real model has been run through them yet, so no results exist). A first HTTP server is built (authenticated decisions, human approvals and the audit trail). A small dashboard (approvals, audit log, eval report) is served by the server. A feature is marked as built only when it has tests behind it; everything else is design.
 
 ---
 
@@ -31,7 +31,7 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 |---|---|---|
 | Tool allowlists and risk levels | Per-tenant rules; each tool is `read`, `write` or `irreversible` | Built (policy engine) |
 | Human approval | Irreversible actions and spend above a threshold wait for an explicit approve or deny | Built in the LangGraph agent loop (pauses with `interrupt`, only a named explicit approval counts, the approver is recorded in state and never shown to the model); approval UI planned |
-| Tamper-evident audit log | Hash-chained records of every decision, who approved or denied what, and what ran | Built (one chain per run in Postgres, wired into the agent loop); read and verify with `agentctl`; no dashboard yet |
+| Tamper-evident audit log | Hash-chained records of every decision, who approved or denied what, and what ran | Built (one chain per run in Postgres, wired into the agent loop); read and verify with `agentctl` or in the dashboard |
 | Budgets and loop detection | Limits on steps, tokens and time, enforced by the runtime, plus an optional cap on the total amount spent in a run | Built in the LangGraph agent loop; a breach of steps, tokens, time or loops halts the run, and a call that would pass the spend cap is refused while the run carries on |
 | Idempotency keys | A crash and resume does not repeat a side effect | Built (Postgres ledger), wired into the LangGraph agent loop |
 | Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Built in the agent loop: you supply a function that returns each tool's current definition, and a pinned tool whose hash changed (or that cannot be read) is refused; reading definitions from a real MCP server is planned |
@@ -71,7 +71,7 @@ The same policy engine is reached through several entry points, so the rules are
 3. **CLI** (`agentctl`, first version built, see below): verify and read an audit chain, dry-run a policy. Approving actions from the CLI is not built.
 4. **Skill**: a portable `SKILL.md` folder for coding agents that support the open skill format.
 5. **Claude Code plugin** (first version built, see below): a `PreToolUse` hook checks each tool call against the policy and answers deny or ask. It fails closed, so an error blocks the call instead of letting it through.
-6. **Dashboard**: a small Next.js app with three pages: approvals, audit log, eval report.
+6. **Dashboard** (built, see "Server"): approvals, audit log and eval report in the browser, served by the server itself as plain HTML and JavaScript with no build step.
 
 ## Demo domain
 
@@ -185,6 +185,9 @@ uv run agentctl keygen --tenant acme --role approver --name alice
 - **Tokens and time.** The step, token and time budgets all apply. Tokens are whatever your runtime reports, so a runtime that under-reports weakens that one budget. Time is wall-clock since the run's first call (idle time included), minus the time a human took to answer asks that were answered; an ask nobody answers does not stop the clock, so an agent cannot freeze its own time budget.
 - **Policy and keys reload without a restart,** when the files change. A file that becomes invalid makes every request fail with 503 until it is fixed; the old version is deliberately not kept, because it might be the looser one. A revoked key stops working on the next request.
 - **Not enforced by the server:** what the tool does after an `allowed`. Do not show the `reason` to the model. Plain HTTP: put TLS in front before exposing it.
+- **Dashboard.** Open `http://127.0.0.1:8000/dashboard/` while the server runs. Type an API key (it stays in that tab's memory: it is not stored, not put in a URL, and sent only to this server in an `Authorization` header). **Approvals** lists calls waiting for a human with the preview of what was asked, and approves or denies them (use an approver key). **Audit log** shows a run's rows and whether its chain verifies. **Eval report** opens a results file from `evals run --out` and shows the numbers recomputed from its runs.
+  - *Why it is safe to show model-written text.* Everything from the log (arguments, tool names, reasons) is text a model chose. The page only ever puts text on the page with `textContent`; tests ban the DOM calls that would turn it into markup (`innerHTML` and the like), dynamic code, navigation from text, storing the key, and any other origin. The server sends a strict Content-Security-Policy (only this server; no inline script or style; no framing), `nosniff`, `no-referrer` and `no-store`. Only four named files are served, read once at startup, so there is no path to traverse. A hostile payload in a call's arguments was checked in a real DOM (jsdom) running the real page against the real server: it appears as literal text, nothing runs.
+  - *Limits.* It is a thin viewer, not a product: no login or sessions (the key is the identity), no live updates beyond an optional 10-second refresh, and it was not tested in a real browser (the browser extension was not available), so expect cosmetic rough edges.
 - Read a server run with `agentctl verify RUN --tenant acme --rows N --head HASH`; a Claude Code session recorded by the hook with `agentctl verify SESSION_ID --hook`.
 
 ## Research question
@@ -223,13 +226,13 @@ Teams that run agents with real side effects and need control and evidence: mult
 
 ## Stack
 
-In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, Pydantic v2, pytest, GitHub Actions. Planned: a Next.js dashboard, OpenTelemetry, Hypothesis. Everything runs locally and needs no paid service.
+In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, Pydantic v2, pytest, GitHub Actions. Planned: OpenTelemetry, Hypothesis. The dashboard is plain HTML and JavaScript with no framework and no third-party code; its logic is tested with Node's built-in test runner. Everything runs locally and needs no paid service.
 
 ## Roadmap
 
 1. Policy engine, fake LLM, tests, HTTP server (done)
 2. LangGraph integration, checkpoint and resume, approvals, budgets
-3. Hash-chained audit log (done), dashboard
+3. Hash-chained audit log and dashboard (done)
 4. MCP surface, CLI and skill, code sandbox
 5. Eval gate (harness built; waiting for a first real run), three-surface comparison
 6. Claude Code plugin and demo
