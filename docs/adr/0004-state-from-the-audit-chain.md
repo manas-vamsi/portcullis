@@ -17,7 +17,8 @@ grow the log.
 ## Consequences
 
 - Good: one source of truth; tampering with history stops the run instead of producing a decision from bad state.
-- Bad: the cost grows with the length of the run. Measured on the server: about 26 ms per decision after 10 calls and about 78 ms after 1000. The run is bounded by `max_steps`, but a long session pays for it. A cache keyed by the chain head would fix this and is not built.
+- Bad, and what was done about it: rebuilding and re-verifying the whole history on every request made the server slower as a run grew (about 78 ms per decision after 1000 calls, measured). The server now keeps what it verified, and reuses it only while the database confirms, with a digest of every stored field of every row, that the history is unchanged to the byte; any difference means a full read and verification as before. After 1000 calls a decision costs about 42 ms (measured). A cache hit still detects an edit anywhere in history. Like plain verification, it cannot detect a rewrite of the whole chain made consistent.
+- The hook runs as a new process each time, so it cannot keep a cache; it reads and verifies the session once per call.
 
 ## Where
 

@@ -18,3 +18,4 @@ known cost or gap, the record says so.
 | 10 | [Policy and key files reload on change, and a bad file refuses everything](0010-reload-fails-closed.md) |
 | 11 | [The dashboard is plain HTML and JavaScript served by the server](0011-dashboard-as-static-files.md) |
 | 12 | [Nothing is claimed that is not built, tested or measured, and weaknesses are pinned by tests](0012-evidence-before-claims.md) |
+| 13 | [The Claude Code hook does not use a background process to go faster](0013-no-background-process-for-the-hook.md) |

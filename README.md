@@ -10,7 +10,7 @@ Portcullis sits in front of an agent's tools and decides, with plain determinist
 >
 > **Built, each with tests behind it:** the deterministic policy engine (allow, deny or ask; allowlists, argument rules, amounts, budgets, loop detection, per-run and per-tenant daily spend caps, tool-definition pinning); a guarded LangGraph agent loop with human approval, an idempotency ledger and crash recovery; a hash-chained audit log; an HTTP server with API keys, approver roles and hot-reloaded policy; a dashboard; a Claude Code hook; a proxy that puts the policy in front of any MCP server; a portable skill file; the `agentctl` CLI; an attack suite; an eval harness with an OpenAI-compatible model adapter; benchmarks and decision records.
 >
-> **Not built, or not done:** no real model has been run through the eval harness, so there are **no results** to quote; OpenTelemetry tracing; a code sandbox; the three-surface (MCP, CLI, library) comparison; a faster Claude Code hook (it adds about 0.7 to 1.0 seconds a call); a cache for the server's per-run state (it slows as a run grows); the dashboard and the MCP proxy have not been tried in a real browser or with a third-party MCP client.
+> **Not built, or not done:** no real model has been run through the eval harness, so there are **no results** to quote; OpenTelemetry tracing; a code sandbox; the three-surface (MCP, CLI, library) comparison; a faster Claude Code hook (it adds about 0.7 to 1.0 seconds a call); the dashboard and the MCP proxy have not been tried in a real browser or with a third-party MCP client.
 >
 > A feature is marked as built only when it has tests behind it. Numbers appear only when they were measured, and weaknesses are written down (see "Known limits") and pinned by tests.
 
@@ -221,26 +221,26 @@ uv run agentctl keygen --tenant acme --role approver --name alice
 
 ## Measured costs
 
-Measured with `benchmarks/run.py` on one machine (Windows-11-10.0.26300-SP0, Intel64 Family 6 Model 186 Stepping 3, 12 logical CPUs, Python 3.12.0, Postgres 16.14 in a local Docker container, 2026-11-19). The raw numbers are in `benchmarks/results/`. They are single-machine, single-run figures: the server and its client share the CPU, Postgres is on loopback, and there is no load test. They say what the order of magnitude is here, not what it will be on your hardware. No model is involved in any of them.
+Measured with `benchmarks/run.py` on one machine (Windows-11-10.0.26300-SP0, Intel64 Family 6 Model 186 Stepping 3, 12 logical CPUs, Python 3.12.0, Postgres 16.14 in a local Docker container, 2026-11-19). The raw numbers are in `benchmarks/results/` (two files: before and after the server's state cache). They are single-machine figures from one run each: the server and its client share the CPU, Postgres is on loopback, and there is no load test. They say what the order of magnitude is here, not what it will be on your hardware. No model is involved in any of them.
 
 | What | Median | 95th percentile | Notes |
 |---|---|---|---|
-| One policy decision, in process | 9 microseconds to 11 microseconds | 31 microseconds at most | four kinds of call, 50,000 samples each |
-| Appending one audit row | 11.9 ms | 16.7 ms | about 81 rows a second from one writer (a transaction and a lock per row) |
-| Verifying a chain | 17 microseconds a row | | 3,000 rows in 51 ms |
-| Server decision, run of 10 calls | 25.8 ms | 31.1 ms | over real HTTP on loopback, with the database |
-| Server decision, run of 100 calls | 34.7 ms | 46.9 ms | |
-| Server decision, run of 500 calls | 52.8 ms | 70.4 ms | |
-| Server decision, run of 1000 calls | 78.4 ms | 102.4 ms | the cost grows with the run: its history is rebuilt from its log each time |
-| Claude Code hook, no database | 658 ms | 751 ms | a fresh process per call, as Claude Code runs it |
-| Claude Code hook, with a database | 1014 ms | 1104 ms | adds the database driver import, a connection and the session's history |
-| MCP proxy, one tool call | adds 2.5 ms | | 1.6 ms direct, 4.1 ms through the proxy, in memory; includes listing the real server's tools on every call |
+| One policy decision, in process | 4 microseconds to 7 microseconds | 9 microseconds at most | four kinds of call, 50,000 samples each |
+| Appending one audit row | 12.6 ms | 21.4 ms | about 76 rows a second from one writer (a transaction and a lock per row) |
+| Verifying a chain | 21 microseconds a row | | 3,000 rows in 63 ms |
+| Server decision, run of 10 calls | 29.6 ms | 42.3 ms | before the state cache: 25.8 ms median, 31.1 ms 95th percentile |
+| Server decision, run of 100 calls | 34.8 ms | 51.9 ms | before the state cache: 34.7 ms median, 46.9 ms 95th percentile |
+| Server decision, run of 500 calls | 36.8 ms | 53.0 ms | before the state cache: 52.8 ms median, 70.4 ms 95th percentile |
+| Server decision, run of 1000 calls | 41.7 ms | 53.3 ms | before the state cache: 78.4 ms median, 102.4 ms 95th percentile |
+| Claude Code hook, no database | 384 ms | 552 ms | a fresh process per call, as Claude Code runs it; an earlier run on the same machine gave 658 ms |
+| Claude Code hook, with a database | 617 ms | 706 ms | adds the database driver import, a connection and the session's history; the earlier run gave 1014 ms |
+| MCP proxy, one tool call | adds 2.1 ms | | 1.4 ms direct, 3.5 ms through the proxy, in memory; includes listing the real server's tools on every call |
 
 What this says in plain words:
 
-- **The policy is not the cost.** A decision takes about ten microseconds. What costs time is everything around it: a database write per decision (about 12 ms), and starting a process per call in the hook.
-- **The hook is the weak spot.** About 0.7 seconds a call without a database and about 1.0 seconds with one is noticeable on every tool call. Earlier profiling on this machine put most of it in process start-up and library imports (Pydantic, and the database driver when a database is set), not in decisions; this benchmark run did not profile it again. A long-running process instead of one per call, or a rewrite in a language that starts faster, would fix it; neither is built.
-- **The server slows as a run grows** (about 26 ms at 10 calls to about 78 ms at 1000) because each decision rebuilds the run's state from its whole log. A cache keyed by the log's latest hash would remove most of that; it is not built. See the decision record on state.
+- **The policy is not the cost.** A decision takes about ten microseconds. What costs time is everything around it: a database write per decision (about 13 ms), and starting a process per call in the hook.
+- **The server's state cache halved the cost of long runs.** A decision after 1000 calls went from 78 ms to 42 ms (after 500 calls: 53 to 37 ms), and short runs are unchanged. The cache reuses a run's verified history only while the database confirms, by a digest of every stored field, that it has not changed by a single byte; any difference means a full read and check, as before. See the decision record on state.
+- **The hook is the weak spot, and its number is noisy.** It takes between about 0.4 and 0.7 seconds a call without a database and between about 0.6 and 1.0 seconds with one, depending on the run: the two runs differ a lot on the same machine, so treat it as a range, not a figure. Earlier profiling put most of it in process start-up and library imports (Pydantic, and the database driver when a database is set), not in decisions. A background process would be faster, but it adds a local file that the agent's own shell could tamper with, which is the wrong trade for a security component (see the decision record on the hook).
 - **Not measured:** anything with a real model, concurrent load, other hardware, a remote database, TLS, or the dashboard. Do not quote these numbers for any of those.
 
 Rerun with `uv run --env-file .env python benchmarks/run.py --out results.json` (`--quick` is a smoke test, not a measurement). It removes every row it writes.
@@ -295,10 +295,9 @@ Not done:
 
 1. A first real-model run of the evals (needs a model endpoint; the harness and adapter are ready), then publishing the numbers with the model name, run count and case-file hash.
 2. A faster Claude Code hook (a long-running process, or an implementation that starts faster).
-3. A cache for the server's per-run state, without weakening the chain check.
-4. OpenTelemetry tracing.
-5. A code sandbox, and the three-surface comparison (MCP, CLI, library) on the demo agent. The comparison needs a real model.
-6. Trying the dashboard in real browsers and the MCP proxy with real clients.
+3. OpenTelemetry tracing.
+4. A code sandbox, and the three-surface comparison (MCP, CLI, library) on the demo agent. The comparison needs a real model.
+5. Trying the dashboard in real browsers and the MCP proxy with real clients.
 
 ## Getting started
 
