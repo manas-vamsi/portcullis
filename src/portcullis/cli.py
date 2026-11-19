@@ -6,7 +6,8 @@
                 [--args JSON | --args @file]
   agentctl keygen --tenant T --role agent|approver --name N   make a server API key (no database needed)
 
-verify and show take --tenant to read a run that was made through the server.
+verify and show take --tenant to read a run that was made through the server, and --hook for a
+Claude Code session recorded by the hook (its run id is the session id).
 
 Exit 2 means the command itself failed (bad input, no database), not that anything is wrong with the log.
 
@@ -28,7 +29,7 @@ from typing import Any
 import psycopg
 from pydantic import ValidationError
 
-from portcullis.audit import GENESIS, events, namespaced, payload_data, require_project_database, verify
+from portcullis.audit import GENESIS, events, hook_run, namespaced, payload_data, require_project_database, verify
 from portcullis.hook import HookError, load_policy
 from portcullis.keys import KeyEntry, hash_key, new_key
 from portcullis.policy import RunState, ToolCall, Verdict, decide
@@ -56,6 +57,8 @@ def connect(env: Mapping[str, str]) -> psycopg.Connection:
 
 def _run(args: argparse.Namespace) -> str:
     """The run name in the log: a server run is stored under its tenant, so --tenant names it."""
+    if args.hook:  # a Claude Code session recorded by the hook (its tenant defaults to claude-code)
+        return hook_run(args.tenant or "claude-code", args.run_id)
     return namespaced(args.tenant, args.run_id) if args.tenant else args.run_id
 
 
@@ -135,6 +138,7 @@ def _parser() -> argparse.ArgumentParser:
     verify_cmd = commands.add_parser("verify", help="check a run's hash chain")
     verify_cmd.add_argument("run_id")
     verify_cmd.add_argument("--tenant", help="the tenant, for a run made through the server")
+    verify_cmd.add_argument("--hook", action="store_true", help="the run is a Claude Code session recorded by the hook")
     verify_cmd.add_argument("--rows", type=int, help="expected number of rows, from a copy kept elsewhere")
     verify_cmd.add_argument("--head", help="expected hash of the last row, from a copy kept elsewhere")
     verify_cmd.set_defaults(run=_verify)
@@ -142,6 +146,7 @@ def _parser() -> argparse.ArgumentParser:
     show_cmd = commands.add_parser("show", help="print a run's rows, then its chain status")
     show_cmd.add_argument("run_id")
     show_cmd.add_argument("--tenant", help="the tenant, for a run made through the server")
+    show_cmd.add_argument("--hook", action="store_true", help="the run is a Claude Code session recorded by the hook")
     show_cmd.set_defaults(run=_show)
 
     keygen_cmd = commands.add_parser("keygen", help="make an API key for the server")

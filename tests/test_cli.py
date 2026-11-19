@@ -7,7 +7,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from portcullis.audit import append, namespaced
+from portcullis.audit import append, hook_run, namespaced
 from portcullis.keys import authenticate, hash_key
 from portcullis.cli import connect, main
 
@@ -71,6 +71,19 @@ def test_verify_and_show_read_a_server_run_with_tenant(conn, run_id, env, capsys
         assert '"event_id": "c1:decision"' in capsys.readouterr().out
     finally:
         conn.execute("DELETE FROM audit_log WHERE run_id = %s", (server_run,))
+
+
+def test_verify_and_show_read_a_claude_code_session_with_hook(conn, run_id, env, capsys):
+    session_run = hook_run("claude-code", run_id)
+    try:
+        append(conn, session_run, "claude-code", "t1:decision", "decision", {"call_id": "t1"})
+        assert main(["verify", run_id, "--hook", "--rows", "1"], env) == 0
+        assert main(["verify", run_id, "--hook", "--tenant", "someone-else"], env) == 1  # another tenant's session
+        assert main(["verify", run_id], env) == 1  # a plain run with that name does not exist
+        assert main(["show", run_id, "--hook"], env) == 0
+        assert '"event_id": "t1:decision"' in capsys.readouterr().out
+    finally:
+        conn.execute("DELETE FROM audit_log WHERE run_id = %s", (session_run,))
 
 
 # --- show ---

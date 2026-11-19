@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import uuid
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from portcullis.audit import verify
+from portcullis.audit import hook_run, namespaced, verify
 from portcullis.hook import main, run
 from portcullis.policy import ArgPattern, Budget, Policy, Risk, TenantPolicy, ToolRule
 
@@ -174,7 +175,7 @@ def test_the_audit_connection_has_statement_and_lock_timeouts(policy_file, monke
     monkeypatch.setattr("psycopg.connect", fake_connect)
 
     code, _, _ = call(
-        event("Read", {"file_path": "a"}), policy_file, PORTCULLIS_DATABASE_URL="postgresql://u:p@h/portcullis"
+        event("Read", {"file_path": "a"}, session_id="s1"), policy_file, PORTCULLIS_DATABASE_URL="postgresql://u:p@h/portcullis"
     )
 
     assert code == 2
@@ -207,16 +208,17 @@ def test_a_bad_policy_blocks_every_call(tmp_path, text):
 
 def test_each_decision_is_written_to_the_audit_chain_without_the_command(postgres_url, conn, policy_file):
     session = f"probe-session-{os.getpid()}"
+    run_name = hook_run("claude-code", session)
     try:
         code, _, _ = call(
             event("Bash", {"command": "git push SECRET-REMOTE"}, session_id=session, tool_use_id="tu1"),
             policy_file,
             PORTCULLIS_DATABASE_URL=postgres_url,
         )
-        rows = conn.execute("SELECT event, payload FROM audit_log WHERE run_id = %s", (session,)).fetchall()
-        chain = verify(conn, session)
+        rows = conn.execute("SELECT event, payload FROM audit_log WHERE run_id = %s", (run_name,)).fetchall()
+        chain = verify(conn, run_name)
     finally:
-        conn.execute("DELETE FROM audit_log WHERE run_id = %s", (session,))
+        conn.execute("DELETE FROM audit_log WHERE run_id = %s", (run_name,))
 
     assert code == 0
     assert [e for e, _ in rows] == ["decision"]
@@ -406,3 +408,118 @@ def test_the_example_policy_blocks_the_obvious_dangers_and_leaves_normal_work_al
     code, out, err = run(event(tool, tool_input), {"PORTCULLIS_POLICY": str(EXAMPLE)})
 
     assert verdict_of(code, out, err) == expected
+
+
+# --- with a database the hook remembers the session: budgets and loop detection ---
+
+
+def stateful_policy(tmp_path, **budget) -> Path:
+    limits = {"max_steps": 100, "max_tokens": 100_000, "max_seconds": 600, "max_identical_calls": 50} | budget
+    tenant = POLICY.tenants["claude-code"].model_copy(update={"budget": Budget(**limits)})
+    path = tmp_path / "stateful.json"
+    path.write_text(Policy(tenants={"claude-code": tenant}).model_dump_json(), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def session(conn):
+    name = f"hs-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    yield name
+    conn.execute("DELETE FROM audit_log WHERE run_id LIKE %s", (f"%{name}%",))
+
+
+def hook(policy_file, url, session_id, tool_use, tool="Read", tool_input=None):
+    stdin = event(tool, tool_input if tool_input is not None else {"file_path": "a"}, session_id=session_id, tool_use_id=tool_use)
+    return call(stdin, policy_file, PORTCULLIS_DATABASE_URL=url) if url else call(stdin, policy_file)
+
+
+def rows_of(conn, session_id):
+    return conn.execute("SELECT count(*) FROM audit_log WHERE run_id = %s", (hook_run("claude-code", session_id),)).fetchone()[0]
+
+
+def test_without_a_database_the_hook_cannot_see_a_loop(tmp_path, session):
+    policy_file = stateful_policy(tmp_path, max_identical_calls=3)
+    assert [hook(policy_file, None, session, f"t{i}")[0] for i in range(6)] == [0] * 6  # stateless: nothing to count
+
+
+def test_with_a_database_the_hook_stops_a_repeating_loop(tmp_path, postgres_url, session):
+    policy_file = stateful_policy(tmp_path, max_identical_calls=3)
+    codes = [hook(policy_file, postgres_url, session, f"t{i}") for i in range(5)]
+    assert [c for c, _, _ in codes] == [0, 0, 0, 2, 2]
+    assert "loop_detected" in codes[3][2] and "run_halted" in codes[4][2]
+
+
+def test_with_a_database_the_hook_enforces_the_step_budget_and_stops_writing_once_halted(tmp_path, postgres_url, conn, session):
+    policy_file = stateful_policy(tmp_path, max_steps=3)
+    codes = [hook(policy_file, postgres_url, session, f"t{i}", tool_input={"file_path": f"f{i}"}) for i in range(8)]
+    assert [c for c, _, _ in codes] == [0, 0, 0, 2, 2, 2, 2, 2]
+    assert "budget_exceeded" in codes[3][2]
+    assert rows_of(conn, session) == 4  # three allowed and the one that halted; the rest are refused without a write
+
+
+def test_each_session_has_its_own_history(tmp_path, postgres_url, session):
+    policy_file = stateful_policy(tmp_path, max_steps=2)
+    other = session + "-other"
+    assert [hook(policy_file, postgres_url, session, f"t{i}", tool_input={"n": i})[0] for i in range(3)] == [0, 0, 2]
+    assert hook(policy_file, postgres_url, other, "t0")[0] == 0  # a different session starts fresh
+
+
+def test_a_repeated_hook_call_gets_the_same_answer_and_is_written_once(tmp_path, postgres_url, conn, session):
+    policy_file = stateful_policy(tmp_path)
+    calls = [
+        ("idA", "Read", {"file_path": "a"}),  # allowed
+        ("idB", "Bash", {"command": "git push"}),  # asks
+        ("idC", "Bash", {"command": "rm -rf /"}),  # denied
+    ]
+    for tool_use, tool, tool_input in calls:
+        first = hook(policy_file, postgres_url, session, tool_use, tool, tool_input)
+        again = hook(policy_file, postgres_url, session, tool_use, tool, tool_input)
+        assert first == again
+    assert rows_of(conn, session) == 3
+
+
+def test_a_retry_of_a_call_that_used_up_the_budget_is_still_answered_as_before(tmp_path, postgres_url, conn, session):
+    # Deciding the retry from scratch would count the call against the budget twice and refuse it.
+    policy_file = stateful_policy(tmp_path, max_steps=1)
+    first = hook(policy_file, postgres_url, session, "only-one")
+    assert first[0] == 0
+    assert hook(policy_file, postgres_url, session, "only-one") == first
+    assert rows_of(conn, session) == 1
+    assert hook(policy_file, postgres_url, session, "a-new-call", tool_input={"file_path": "b"})[0] == 2
+
+
+def test_the_hook_refuses_to_decide_from_a_session_history_that_was_tampered_with(tmp_path, postgres_url, conn, session):
+    policy_file = stateful_policy(tmp_path)
+    hook(policy_file, postgres_url, session, "t0")
+    conn.execute("UPDATE audit_log SET payload = '{}' WHERE run_id = %s", (hook_run("claude-code", session),))
+    code, out, err = hook(policy_file, postgres_url, session, "t1")
+    assert (code, out) == (2, "") and "does not verify" in err
+
+
+def test_the_record_has_what_the_server_needs_and_never_appears_in_the_servers_approval_queue(tmp_path, postgres_url, conn, session):
+    policy_file = stateful_policy(tmp_path)
+    hook(policy_file, postgres_url, session, "tu-ask", "Bash", {"command": "git push origin main"})  # an ask
+
+    [(payload,)] = conn.execute("SELECT payload FROM audit_log WHERE run_id = %s", (hook_run("claude-code", session),)).fetchall()
+    data = json.loads(payload)
+    assert (data["call_id"], data["verdict"], data["amount"], data["tokens"]) == ("tu-ask", "ask", 0, 0)
+    assert len(data["request_sha256"]) == 64 and "git push" not in payload
+    prefix = namespaced("claude-code", "")[:-2]  # what the server's pending list looks for
+    assert conn.execute("SELECT count(*) FROM audit_log WHERE run_id = %s AND starts_with(run_id, %s)", (hook_run("claude-code", session), prefix)).fetchone()[0] == 0
+
+
+def test_a_reused_tool_use_id_does_not_lend_its_answer_to_a_different_call(tmp_path, postgres_url, conn, session):
+    policy_file = stateful_policy(tmp_path)
+    assert hook(policy_file, postgres_url, session, "call_1", "Read", {"file_path": "a"})[0] == 0  # allowed
+    code, out, err = hook(policy_file, postgres_url, session, "call_1", "Bash", {"command": "rm -rf /home"})
+    assert (code, out) == (2, "") and "id_reused" in err
+    assert rows_of(conn, session) == 1  # the refusal wrote nothing
+    assert hook(policy_file, postgres_url, session, "call_1", "Read", {"file_path": "a"})[0] == 0  # the true retry still works
+
+
+def test_with_a_database_an_event_without_a_session_id_is_blocked_not_pooled_with_others(tmp_path, postgres_url):
+    policy_file = stateful_policy(tmp_path)
+    for body in (event("Read", {"file_path": "a"}), event("Read", {"file_path": "a"}, session_id=""), event("Read", {"file_path": "a"}, session_id=7)):
+        code, out, err = call(body, policy_file, PORTCULLIS_DATABASE_URL=postgres_url)
+        assert (code, out) == (2, "") and "session_id" in err
+    assert call(event("Read", {"file_path": "a"}), policy_file)[0] == 0  # without a database nothing needs a session
