@@ -10,7 +10,7 @@ Portcullis sits in front of an agent's tools and decides, with plain determinist
 >
 > **Built, each with tests behind it:** the deterministic policy engine (allow, deny or ask; allowlists, argument rules, amounts, budgets, loop detection, per-run and per-tenant daily spend caps, tool-definition pinning); a guarded LangGraph agent loop with human approval, an idempotency ledger and crash recovery; a hash-chained audit log; an HTTP server with API keys, approver roles and hot-reloaded policy; a dashboard; a Claude Code hook; a proxy that puts the policy in front of any MCP server; a portable skill file; the `agentctl` CLI; an attack suite; an eval harness with an OpenAI-compatible model adapter; benchmarks and decision records.
 >
-> **Not built, or not done:** no real model has been run through the eval harness, so there are **no results** to quote; OpenTelemetry tracing; a code sandbox; the three-surface (MCP, CLI, library) comparison; a faster Claude Code hook (it adds about 0.7 to 1.0 seconds a call); the dashboard and the MCP proxy have not been tried in a real browser or with a third-party MCP client.
+> **Not built, or not done:** no real model has been run through the eval harness, so there are **no results** to quote; a code sandbox; the three-surface (MCP, CLI, library) comparison; a faster Claude Code hook (it adds about 0.7 to 1.0 seconds a call); the dashboard and the MCP proxy have not been tried in a real browser or with a third-party MCP client.
 >
 > A feature is marked as built only when it has tests behind it. Numbers appear only when they were measured, and weaknesses are written down (see "Known limits") and pinned by tests.
 
@@ -42,7 +42,7 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 | Idempotency keys | A crash and resume does not repeat a side effect | Built (Postgres ledger), wired into the LangGraph agent loop |
 | Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Built in the agent loop: you supply a function that returns each tool's current definition, and a pinned tool whose hash changed (or that cannot be read) is refused; the MCP proxy reads definitions from a real MCP server and checks them on every call (see "MCP proxy") |
 | Crash recovery | Resume a run from a Postgres checkpoint (LangGraph) | Tested with a hard-killed worker, including the repeat-effect cases below |
-| Tracing | Every run can be inspected end to end (OpenTelemetry) | Planned |
+| Tracing | Decisions and approvals appear as OpenTelemetry spans | Built, optional (see "Tracing"); tested with an in-memory exporter, not against a real collector |
 | Eval gate | Block a release if the agent got measurably worse | Harness and gate built and tested with scripted models; **no real model has been run yet, so there are no results** (see "Evals") |
 
 ## How it works
@@ -245,6 +245,19 @@ What this says in plain words:
 
 Rerun with `uv run --env-file .env python benchmarks/run.py --out results.json` (`--quick` is a smoke test, not a measurement). It removes every row it writes.
 
+## Tracing
+
+Optional OpenTelemetry spans for decisions, off unless you turn it on. Install with `uv sync --extra tracing`, then set an OTLP endpoint and run the server (the usual `OTEL_*` variables, such as `OTEL_SERVICE_NAME`, apply):
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 uv run python -m portcullis.server
+```
+
+- **What is traced.** A decision is a span `portcullis.decide`, an approval is `portcullis.approval`, on the server, in the LangGraph agent loop and in the MCP proxy. Attributes come from a fixed list: `portcullis.surface` (server, agent or mcp), `tenant`, `tool`, `verdict` and `rule` (or `status`), `approved`, and `run` (a hash of the run name, so traces can be grouped by run without revealing it).
+- **What can never be on a span.** Arguments, results, approver names, call ids and secrets are not in the list, and anything not in it is dropped; values that are not plain numbers, booleans or text are dropped; long text is cut. A test sends hostile arguments through each surface and checks none reaches a span.
+- **It never gets in the way.** A missing, misconfigured or broken tracing library cannot break or block a decision; an exception from the traced work still propagates and is recorded on the span. Measured on one machine, a traced decision adds about 12 microseconds with the library installed and no provider, about 2 without the library, and about 49 when recording to memory.
+- **Limits.** The Claude Code hook does not trace (it is a new process per call, and exporting from a process that lives for one decision would add delay to every tool call). In the agent loop a call is traced again if LangGraph re-runs an interrupted node after an approval. It is tested with an in-memory exporter; it has not been tried against a real collector.
+
 ## Decision records
 
 The decisions that shape the design (why the policy is deterministic, why everything fails closed, why state lives in the audit chain, what each approval channel is worth, and what each decision costs) are short records in [`docs/adr/`](docs/adr/README.md). A test checks that each has the same sections, that every file it names exists, and that none claims exactly-once delivery or tamper-proofness.
@@ -285,7 +298,7 @@ Teams that run agents with real side effects and need control and evidence: mult
 
 ## Stack
 
-In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, Pydantic v2, pytest, GitHub Actions. Planned: OpenTelemetry, Hypothesis. The dashboard is plain HTML and JavaScript with no framework and no third-party code; its logic is tested with Node's built-in test runner. Everything runs locally and needs no paid service.
+In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, Pydantic v2, pytest, GitHub Actions. Optional: OpenTelemetry for tracing. Planned: Hypothesis. The dashboard is plain HTML and JavaScript with no framework and no third-party code; its logic is tested with Node's built-in test runner. Everything runs locally and needs no paid service.
 
 ## Roadmap
 
@@ -295,9 +308,8 @@ Not done:
 
 1. A first real-model run of the evals (needs a model endpoint; the harness and adapter are ready), then publishing the numbers with the model name, run count and case-file hash.
 2. A faster Claude Code hook (a long-running process, or an implementation that starts faster).
-3. OpenTelemetry tracing.
-4. A code sandbox, and the three-surface comparison (MCP, CLI, library) on the demo agent. The comparison needs a real model.
-5. Trying the dashboard in real browsers and the MCP proxy with real clients.
+3. A code sandbox, and the three-surface comparison (MCP, CLI, library) on the demo agent. The comparison needs a real model.
+4. Trying the dashboard in real browsers, the MCP proxy with real clients, and tracing against a real collector.
 
 ## Getting started
 
