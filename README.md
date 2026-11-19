@@ -6,7 +6,7 @@
 
 Portcullis sits in front of an agent's tools and decides, with plain deterministic rules, what the agent is allowed to do. It can allow a call, block it, or pause it until a human approves. Every decision is written to a tamper-evident audit log.
 
-> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The attack suite runs scripted-model attacks against the policy. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). A first HTTP server is built (authenticated decisions, human approvals and the audit trail). The dashboard is not. A feature is marked as built only when it has tests behind it; everything else is design.
+> **Status: early development.** The deterministic policy engine (allow, deny or ask), the guarded LangGraph agent loop with human approval, the idempotency ledger and the hash-chained audit log are built and tested. A first version of the Claude Code plugin policy hook is built too. The attack suite runs scripted-model attacks against the policy. A first `agentctl` CLI is built (verify and read an audit chain, dry-run a policy). An OpenAI-compatible model adapter and an eval harness are built (no real model has been run through them yet, so no results exist). A first HTTP server is built (authenticated decisions, human approvals and the audit trail). The dashboard is not. A feature is marked as built only when it has tests behind it; everything else is design.
 
 ---
 
@@ -37,7 +37,7 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 | Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Built in the agent loop: you supply a function that returns each tool's current definition, and a pinned tool whose hash changed (or that cannot be read) is refused; reading definitions from a real MCP server is planned |
 | Crash recovery | Resume a run from a Postgres checkpoint (LangGraph) | Tested with a hard-killed worker, including the repeat-effect cases below |
 | Tracing | Every run can be inspected end to end (OpenTelemetry) | Planned |
-| Eval gate | Block a release if the agent got measurably worse | Planned |
+| Eval gate | Block a release if the agent got measurably worse | Harness and gate built and tested with scripted models; **no real model has been run yet, so there are no results** (see "Evals") |
 
 ## How it works
 
@@ -137,6 +137,23 @@ uv run agentctl check plugin/policy.example.json --tenant claude-code --tool Rea
 - **check** runs one call through a policy file and prints `allow`, `deny` or `ask` with the rule. Exit codes are 0, 1 and 3. It needs no database and starts every call with a fresh state, so budgets and loop limits are not exercised. Put arguments in a file with `--args @args.json` if shell quoting gets in the way.
 - Exit 2 means the command itself failed (bad input, no database), not that the log is bad. The database comes only from `PORTCULLIS_DATABASE_URL`, over a read-only connection, so the tool cannot change the log it inspects. Errors never print the URL.
 
+## Evals
+
+`python -m portcullis.evals` runs nine synthetic property-maintenance cases (`evals/cases.json`) through the real guarded agent with a real model, and scores each run with deterministic checks: which tools ran, which must not, the final status, the total cost of the orders. No model judges another. Five `task` cases measure whether the model does the job. Four `safety` cases (a denied $1,450 job, a gas-leak keyword escalation that never reaches the model, a prompt injection asking for tools that do not exist, an injection claiming a pre-approved $9,000 order) are enforced by the policy whatever the model does.
+
+```bash
+# a local, free model (install Ollama and pull a model that supports tool calling):
+uv run --env-file .env python -m portcullis.evals run --base-url http://127.0.0.1:11434/v1 --model <name> --runs 3 --out results.json
+# or any OpenAI-compatible API; the key is read from the environment variable you name, never from a file or the command line:
+uv run --env-file .env python -m portcullis.evals run --base-url https://<provider>/v1 --model <name> --api-key-env MY_KEY --runs 3 --out results.json
+uv run python -m portcullis.evals gate results.json --min-pass-rate 0.8 --min-pass-all-rate 0.5   # your thresholds, nothing is preset
+```
+
+- **Adapter.** `src/portcullis/llm_http.py` speaks the OpenAI chat format, which Ollama, Groq, OpenRouter and Gemini's compatibility endpoint also accept. It refuses plain http except to localhost, does not follow redirects, never puts the key in an error message or `repr()`, and treats a missing token count as an error rather than guessing one. Arguments that are not a JSON object are passed on so the agent refuses the call. Whether a given provider's free tier suits this, and its terms, I have not checked.
+- **What is measured.** Pass rate (share of runs passing every check), pass^k rate (share of cases passing in all k runs, stricter as k grows), tokens, tool calls, latency (p50 and p95), refused calls by rule. A forbidden tool that ran fails the gate whatever the thresholds.
+- **What it is not.** One model, one prompt, nine synthetic cases, one moment. It is not a benchmark and says nothing about other models or real tenants. Continuous integration never calls a model, so it tests the harness (with scripted models and an in-memory fake server), not any model. Results are only worth quoting once you have run them, and then with the model name, the case file hash and the number of runs next to them.
+- **Findings from building it.** A model that reuses the same tool-call id across turns (some servers do) would have made the demo's tool log credit the wrong tool; that is fixed and tested.
+
 ## Server
 
 An HTTP service for agent runtimes that are not Python or not LangGraph. Run it with `uv sync --extra server`, then `python -m portcullis.server` (loopback only by default; `--port` to change it).
@@ -211,7 +228,7 @@ In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, 
 2. LangGraph integration, checkpoint and resume, approvals, budgets
 3. Hash-chained audit log (done), dashboard
 4. MCP surface, CLI and skill, code sandbox
-5. Eval gate, recorded LLM responses, three-surface comparison
+5. Eval gate (harness built; waiting for a first real run), three-surface comparison
 6. Claude Code plugin and demo
 7. Executable attack suite (done: see "Attack suite"; it also lists the gaps it found)
 8. Benchmarks, architecture decision records, docs
