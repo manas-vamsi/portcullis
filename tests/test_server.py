@@ -5,7 +5,10 @@ tested for authentication, validation and error mapping.
 """
 
 import json
+import os
 import threading
+import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -45,6 +48,8 @@ def make_policy(**overrides) -> Policy:
             deny_if=(ArgPattern(arg="vendor_id", regex=r"^(?!acme-)", required=True),),
         ),
         "delete_property": ToolRule(risk=Risk.IRREVERSIBLE),
+        "rotate_credentials": ToolRule(risk=Risk.IRREVERSIBLE, ask_if=(ArgPattern(arg="password", regex=r"\S"),)),
+        "notify_tenant": ToolRule(risk=Risk.READ, ask_if=(ArgPattern(arg="message", regex=r"(?i)password\s*="),)),
         "pinned_lookup": ToolRule(risk=Risk.READ, pinned_sha256=PIN),
     }
     globex = TenantPolicy(budget=budget(), tools={"check_vendor_availability": ToolRule(risk=Risk.READ)})
@@ -64,6 +69,7 @@ def rid(conn):
     name = f"srv-{uuid4()}"
     yield name
     conn.execute("DELETE FROM audit_log WHERE run_id LIKE %s", (f"%{name}%",))
+    conn.execute("DELETE FROM spend_ledger WHERE run_id LIKE %s", (f"%{name}%",))
 
 
 @pytest.fixture
@@ -544,3 +550,346 @@ def test_an_invalid_policy_file_is_an_error(tmp_path):
     env = {"PORTCULLIS_POLICY": str(bad), "PORTCULLIS_KEYS": "k", "PORTCULLIS_DATABASE_URL": "u"}
     with pytest.raises(ValueError, match="policy"):
         app_from_env(env)
+
+
+# --- the runtime says a call was made (`executed`) ---
+
+
+def test_once_a_call_is_reported_executed_asking_about_it_again_says_so_instead_of_allowed(gateway, rid):
+    assert place(gateway, rid, "c1", cost=100)["status"] == "allowed"
+
+    assert gateway.mark_executed("acme", rid, "c1")["status"] == "executed"
+    assert place(gateway, rid, "c1", cost=100)["status"] == "executed"  # a replay is no longer a fresh permission
+    assert gateway.call_status("acme", rid, "c1")["status"] == "executed"
+    assert gateway.mark_executed("acme", rid, "c1")["status"] == "executed"  # saying it twice is harmless
+
+
+def test_an_approved_call_can_be_reported_executed(gateway, rid):
+    place(gateway, rid, "big", cost=900)
+    gateway.answer("acme", rid, "big", True, "alice")
+    assert gateway.mark_executed("acme", rid, "big")["status"] == "executed"
+
+
+def test_a_call_that_was_not_allowed_cannot_be_reported_executed(gateway, rid):
+    decide(gateway, rid, "denied", tool="drop_database")
+    place(gateway, rid, "waiting", cost=900)
+    place(gateway, rid, "refused", cost=900)
+    gateway.answer("acme", rid, "refused", False, "alice")
+    for call_id in ("denied", "waiting", "refused"):
+        with pytest.raises(Conflict):
+            gateway.mark_executed("acme", rid, call_id)
+    with pytest.raises(NotFound):
+        gateway.mark_executed("acme", rid, "missing")
+
+
+def test_only_an_agent_key_can_report_a_call_executed(client, rid):
+    post_call(client, rid, "c1")
+    url = f"/v1/runs/{rid}/calls/c1/executed"
+    assert client.post(url, headers=bearer(APPROVER)).status_code == 403
+    assert client.post(url, headers=bearer(OTHER_AGENT)).status_code == 404  # another tenant cannot see it
+    done = client.post(url, headers=bearer(AGENT))
+    assert (done.status_code, done.json()["status"]) == (200, "executed")
+    assert client.post(f"/v1/runs/{rid}/calls/zzz/executed", headers=bearer(AGENT)).status_code == 404
+
+
+# --- the approver sees the arguments ---
+
+
+def test_a_call_waiting_for_a_human_carries_a_preview_of_its_arguments(gateway, rid):
+    view = place(gateway, rid, "big", cost=900)
+    assert json.loads(view["args_preview"]) == {"cost": 900, "unit": "big", "vendor_id": "acme-V1"}
+    assert view["args_truncated"] is False
+    [waiting] = [p for p in gateway.pending("acme") if p["run_id"] == rid]
+    assert waiting["args_preview"] == view["args_preview"]
+
+
+def test_a_long_argument_list_is_cut_and_marked_as_cut(gateway, rid):
+    view = gateway.decide_call("acme", rid, "big", "create_work_order", {"cost": 900, "vendor_id": "acme-V1", "note": "x" * 5000}, None)
+    assert len(view["args_preview"]) == 2000 and view["args_truncated"] is True
+
+
+def test_calls_that_do_not_wait_for_a_human_carry_no_preview(gateway, rid):
+    assert "args_preview" not in place(gateway, rid, "small", cost=100)
+    assert "args_preview" not in decide(gateway, rid, "denied", tool="drop_database")
+
+
+def test_a_call_that_matched_a_sensitive_pattern_is_not_stored_in_the_clear(gateway, conn, rid):
+    secret = {"message": "my password = hunter2-very-secret", "unit": "4"}
+    view = gateway.decide_call("acme", rid, "leak", "notify_tenant", secret, None)
+
+    assert (view["status"], view["rule"]) == ("pending_approval", "sensitive_argument")
+    assert "args_preview" not in view
+    stored = " ".join(row["payload"] for row in events(conn, namespaced("acme", rid)))
+    assert "hunter2" not in stored
+    [waiting] = [p for p in gateway.pending("acme") if p["run_id"] == rid]
+    assert "args_preview" not in waiting
+
+
+# --- starting runs too fast ---
+
+
+def test_a_tenant_cannot_start_runs_faster_than_its_limit(pool, rid, monkeypatch):
+    limited = Gateway(make_policy(), pool, new_runs_per_minute=2)
+    decide(limited, rid + "-1", "c1")
+    decide(limited, rid + "-2", "c1")
+    with pytest.raises(Busy):
+        decide(limited, rid + "-3", "c1")
+    decide(limited, rid + "-1", "c2", args={"n": 2})  # a run that already exists is not a new run
+    decide(limited, rid + "-9", "c1", tenant="globex")  # another tenant has its own allowance
+
+    later = time.monotonic() + 61
+    monkeypatch.setattr("portcullis.server.time.monotonic", lambda: later)
+    decide(limited, rid + "-3", "c1")  # a minute on, there is room again
+
+
+# --- tokens and time ---
+
+
+def test_tokens_reported_by_the_runtime_add_up_against_the_token_budget(pool, rid):
+    gateway = Gateway(make_policy(max_tokens=1000), pool)
+    for i, tokens in enumerate((600, 500)):
+        assert gateway.decide_call("acme", rid, f"c{i}", "check_vendor_availability", {"n": i}, None, tokens)["status"] == "allowed"
+    stop = gateway.decide_call("acme", rid, "c9", "check_vendor_availability", {"n": 9}, None, 0)
+    assert (stop["rule"], stop["halt"]) == ("budget_exceeded", True)
+
+
+def test_a_retry_does_not_count_its_tokens_twice(pool, rid):
+    gateway = Gateway(make_policy(max_tokens=1000), pool)
+    for _ in range(5):
+        gateway.decide_call("acme", rid, "c1", "check_vendor_availability", {}, None, 300)
+    assert gateway.decide_call("acme", rid, "c2", "check_vendor_availability", {"n": 2}, None, 0)["status"] == "allowed"
+
+
+def test_the_time_budget_counts_from_the_first_call(pool, rid):
+    offset = [timedelta(0)]
+    gateway = Gateway(make_policy(max_seconds=60), pool, clock=lambda: datetime.now(timezone.utc) + offset[0])
+    assert decide(gateway, rid, "c1")["status"] == "allowed"
+    offset[0] = timedelta(seconds=61)  # the run has now been going for 61 seconds
+    assert decide(gateway, rid, "c2", args={"n": 2})["rule"] == "budget_exceeded"
+
+
+def test_an_ask_nobody_answers_does_not_freeze_the_time_budget(pool, rid):
+    offset = [timedelta(0)]
+    gateway = Gateway(make_policy(max_seconds=60), pool, clock=lambda: datetime.now(timezone.utc) + offset[0])
+    place(gateway, rid, "big", cost=900)  # the first call, and it waits for a person who never answers
+    offset[0] = timedelta(minutes=30)
+    assert decide(gateway, rid, "c2", args={"n": 2})["rule"] == "budget_exceeded"  # time kept running
+
+
+# --- the tenant's daily spend cap, across runs ---
+
+
+def capped_gateway(pool, per_day=1000, **overrides):
+    budget_args = {"max_spend": None, "max_spend_per_day": per_day, "max_steps": 50} | overrides
+    tools = {"create_work_order": ToolRule(risk=Risk.WRITE, approve_above=Threshold(arg="cost", limit=500))}
+    policy = Policy(tenants={"capped": TenantPolicy(budget=budget(**budget_args), tools=tools)})
+    return Gateway(policy, pool)
+
+
+@pytest.fixture
+def capped(pool, conn):
+    conn.execute("DELETE FROM spend_ledger WHERE tenant = 'capped'")
+    yield capped_gateway(pool)
+    conn.execute("DELETE FROM spend_ledger WHERE tenant = 'capped'")
+    conn.execute("DELETE FROM audit_log WHERE tenant_id = 'capped'")
+
+
+def spend(gateway, run, call_id, cost):
+    return gateway.decide_call("capped", run, call_id, "create_work_order", {"cost": cost, "u": call_id}, None)
+
+
+def test_spend_in_one_run_counts_against_the_tenants_daily_cap_in_another(capped, rid):
+    assert [spend(capped, rid + "-1", f"a{i}", 400)["status"] for i in range(2)] == ["allowed", "allowed"]
+
+    refused = spend(capped, rid + "-2", "b0", 400)  # a brand new run, but the tenant has already spent 800 today
+    assert (refused["status"], refused["rule"]) == ("denied", "tenant_spend_cap_exceeded")
+    assert spend(capped, rid + "-2", "b1", 200)["status"] == "allowed"  # exactly up to the cap is fine
+    assert spend(capped, rid + "-3", "c0", 1)["rule"] == "tenant_spend_cap_exceeded"
+
+
+def test_a_retry_is_not_charged_twice(capped, rid):
+    for _ in range(5):
+        spend(capped, rid, "a0", 400)
+    assert spend(capped, rid + "-2", "b0", 400)["status"] == "allowed"  # 400 + 400: the replays were charged once
+    assert spend(capped, rid + "-2", "b1", 400)["rule"] == "tenant_spend_cap_exceeded"  # and 800 + 400 is over
+
+
+def test_concurrent_runs_of_one_tenant_cannot_overshoot_its_daily_cap(pool, conn, rid, monkeypatch):
+    real_charge = Gateway._charge
+
+    def slow_charge(self, *args):  # widen the gap between reading the total and writing the charge
+        time.sleep(0.2)
+        real_charge(self, *args)
+
+    monkeypatch.setattr(Gateway, "_charge", slow_charge)
+    conn.execute("DELETE FROM spend_ledger WHERE tenant = 'capped'")
+    try:
+        gateway = capped_gateway(pool)
+        views, barrier = [], threading.Barrier(8)
+
+        def worker(i):
+            barrier.wait()
+            views.append(spend(gateway, f"{rid}-{i}", "c0", 400))  # eight different runs at once
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+
+        assert sorted(v["status"] for v in views) == ["allowed"] * 2 + ["denied"] * 6
+    finally:
+        conn.execute("DELETE FROM spend_ledger WHERE tenant = 'capped'")
+        conn.execute("DELETE FROM audit_log WHERE tenant_id = 'capped'")
+
+
+def test_an_approval_is_checked_against_the_daily_cap_again_and_then_counts_toward_it(capped, rid):
+    assert spend(capped, rid + "-1", "big", 900)["status"] == "pending_approval"  # fits today, waits for a person
+    assert spend(capped, rid + "-2", "small", 400)["status"] == "allowed"  # meanwhile another run spends 400
+
+    blocked = capped.answer("capped", rid + "-1", "big", True, "alice")  # 400 + 900 would pass the cap
+    assert (blocked["status"], blocked["blocked_by"]) == ("approval_denied", "tenant_spend_cap_exceeded")
+
+    assert spend(capped, rid + "-3", "ask", 450)["status"] == "allowed"  # 400 + 450 fits
+    assert spend(capped, rid + "-4", "next", 400)["rule"] == "tenant_spend_cap_exceeded"
+
+
+def test_an_approved_call_counts_toward_the_daily_cap(capped, rid):
+    spend(capped, rid, "big", 900)
+    assert capped.answer("capped", rid, "big", True, "alice")["status"] == "approved"
+    assert spend(capped, rid + "-2", "next", 200)["rule"] == "tenant_spend_cap_exceeded"
+
+
+def test_no_daily_cap_means_the_ledger_is_kept_but_never_consulted(pool, conn, rid):
+    conn.execute("DELETE FROM spend_ledger WHERE tenant = 'capped'")
+    try:
+        gateway = capped_gateway(pool, per_day=None)
+        assert all(spend(gateway, f"{rid}-{i}", "c", 400)["status"] == "allowed" for i in range(5))
+        total = conn.execute("SELECT sum(amount) FROM spend_ledger WHERE tenant = 'capped'").fetchone()[0]
+        assert total == 2000
+    finally:
+        conn.execute("DELETE FROM spend_ledger WHERE tenant = 'capped'")
+        conn.execute("DELETE FROM audit_log WHERE tenant_id = 'capped'")
+
+
+def test_spend_older_than_a_day_no_longer_counts(capped, conn, rid):
+    spend(capped, rid + "-1", "a0", 900)
+    conn.execute("UPDATE spend_ledger SET ts = now() - interval '25 hours' WHERE tenant = 'capped'")
+    assert spend(capped, rid + "-2", "b0", 400)["status"] == "allowed"
+
+
+# --- changing the policy and the keys without a restart ---
+
+
+def bump(path, text):
+    path.write_text(text, encoding="utf-8")
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+
+
+@pytest.fixture
+def live(tmp_path, postgres_url):
+    policy, keys = tmp_path / "policy.json", tmp_path / "keys.json"
+    policy.write_text(make_policy().model_dump_json(), encoding="utf-8")
+    keys.write_text(json.dumps({"keys": [k.model_dump() for k in KEYS]}), encoding="utf-8")
+    env = {"PORTCULLIS_POLICY": str(policy), "PORTCULLIS_KEYS": str(keys), "PORTCULLIS_DATABASE_URL": postgres_url}
+    with TestClient(app_from_env(env)) as test_client:
+        yield test_client, policy, keys
+
+
+def test_an_edited_policy_takes_effect_on_the_next_request_without_a_restart(live, rid):
+    client, policy_file, _ = live
+    assert post_call(client, rid, "c1").json()["status"] == "allowed"
+    tighter = make_policy()
+    tools = {k: v for k, v in tighter.tenants["acme"].tools.items() if k != "check_vendor_availability"}
+    tighter = Policy(tenants={**tighter.tenants, "acme": tighter.tenants["acme"].model_copy(update={"tools": tools})})
+    bump(policy_file, tighter.model_dump_json())
+
+    assert post_call(client, rid, "c2", {"tool": "check_vendor_availability", "args": {"n": 2}}).json()["rule"] == "tool_not_allowed"
+
+
+def test_a_broken_policy_file_stops_every_request_until_it_is_fixed(live, rid):
+    client, policy_file, _ = live
+    bump(policy_file, "{ not valid")
+
+    refused = post_call(client, rid, "c1")
+    assert refused.status_code == 503 and refused.json() == {"detail": "server configuration is unavailable"}
+    assert client.get("/healthz").status_code == 503
+
+    bump(policy_file, make_policy().model_dump_json())
+    assert post_call(client, rid, "c1").json()["status"] == "allowed"
+    assert client.get("/healthz").status_code == 200
+
+
+def test_a_revoked_key_stops_working_at_once_and_a_broken_key_file_refuses_everything(live, rid):
+    client, _, keys_file = live
+    assert post_call(client, rid, "c1").status_code == 200
+
+    revoked = [k.model_dump() for k in KEYS if k.name != "runtime-1"]
+    bump(keys_file, json.dumps({"keys": revoked}))
+    assert post_call(client, rid, "c2").status_code == 401
+
+    bump(keys_file, "garbage")
+    refused = post_call(client, rid, "c3", key=OTHER_AGENT)  # even a key that was valid a moment ago
+    assert refused.status_code == 503 and refused.json() == {"detail": "server configuration is unavailable"}
+    assert client.get("/healthz").status_code == 503
+
+    bump(keys_file, json.dumps({"keys": [k.model_dump() for k in KEYS]}))
+    assert post_call(client, rid, "c4").status_code == 200
+
+
+def test_a_decision_made_while_the_policy_is_broken_never_reaches_the_log(live, conn, rid):
+    client, policy_file, _ = live
+    bump(policy_file, "oops")
+    post_call(client, rid, "c1")
+    assert conn.execute("SELECT count(*) FROM audit_log WHERE run_id LIKE %s", (f"%{rid}%",)).fetchone()[0] == 0
+
+
+def test_a_chain_that_verifies_but_tells_an_impossible_story_gets_no_more_decisions(gateway, conn, rid):
+    from portcullis.audit import append
+
+    decide(gateway, rid, "c1")
+    # a validly chained row, but an approval for a call that was never decided
+    append(conn, namespaced("acme", rid), "acme", "ghost:approval", "approval", {"call_id": "ghost", "approved": True})
+    with pytest.raises(ChainBroken):
+        decide(gateway, rid, "c2")
+
+
+def test_a_secret_is_not_stored_when_another_rule_decided_the_call_first(gateway, conn, rid):
+    view = gateway.decide_call("acme", rid, "rot", "rotate_credentials", {"password": "hunter2-very-secret"}, None)
+
+    assert (view["status"], view["rule"]) == ("pending_approval", "irreversible_action")  # not "sensitive_argument"
+    assert "args_preview" not in view
+    stored = " ".join(row["payload"] for row in events(conn, namespaced("acme", rid)))
+    assert "hunter2" not in stored
+
+
+def test_with_a_broken_policy_file_even_the_read_endpoints_refuse(live, rid):
+    client, policy_file, _ = live
+    post_call(client, rid, "c1")
+    bump(policy_file, "{ broken")
+    for method, path in (
+        ("get", f"/v1/runs/{rid}/calls/c1"),
+        ("post", f"/v1/runs/{rid}/calls/c1/executed"),
+        ("get", "/v1/approvals"),
+        ("get", f"/v1/runs/{rid}/audit"),
+    ):
+        key = APPROVER if path == "/v1/approvals" else AGENT
+        assert getattr(client, method)(path, headers=bearer(key)).status_code == 503, path
+
+
+def test_the_pending_list_skips_a_row_that_is_not_shaped_like_ours(gateway, conn, rid):
+    from portcullis.audit import append
+
+    place(gateway, rid, "ok", cost=900)
+    append(conn, namespaced("acme", rid), "acme", "junk:decision", "decision", {"verdict": "ask"})  # no call_id, tool...
+    assert [p["call_id"] for p in gateway.pending("acme") if p["run_id"] == rid] == ["ok"]
+
+
+def test_the_ledger_keeps_the_larger_amount_for_a_call_and_forgets_old_rows(capped, conn, rid):
+    capped._charge(conn, "capped", rid, "c1", 100)
+    capped._charge(conn, "capped", rid, "c1", 400)  # the same call charged again with a larger amount
+    capped._charge(conn, "capped", rid, "c1", 50)
+    assert conn.execute("SELECT amount FROM spend_ledger WHERE run_id = %s", (rid,)).fetchone()[0] == 400
+
+    conn.execute("INSERT INTO spend_ledger (tenant, run_id, call_id, amount, ts) VALUES ('capped', %s, 'old', 1, now() - interval '49 hours')", (rid,))
+    spend(capped, rid + "-2", "b0", 100)  # a capped call reads the tenant's total and tidies up
+    assert conn.execute("SELECT count(*) FROM spend_ledger WHERE call_id = 'old'").fetchone()[0] == 0
