@@ -34,7 +34,7 @@ Portcullis is a normal server plus a library. It is not an agent, and no LLM mak
 | Tamper-evident audit log | Hash-chained records of every decision, who approved or denied what, and what ran | Built (one chain per run in Postgres, wired into the agent loop); read and verify with `agentctl` or in the dashboard |
 | Budgets and loop detection | Limits on steps, tokens and time, enforced by the runtime, plus an optional cap on the total amount spent in a run | Built in the LangGraph agent loop; a breach of steps, tokens, time or loops halts the run, and a call that would pass the spend cap is refused while the run carries on |
 | Idempotency keys | A crash and resume does not repeat a side effect | Built (Postgres ledger), wired into the LangGraph agent loop |
-| Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Built in the agent loop: you supply a function that returns each tool's current definition, and a pinned tool whose hash changed (or that cannot be read) is refused; reading definitions from a real MCP server is planned |
+| Tool definition pinning | Pinned hashes of MCP tool definitions; refuse tools that changed (rug-pull defense) | Built in the agent loop: you supply a function that returns each tool's current definition, and a pinned tool whose hash changed (or that cannot be read) is refused; the MCP proxy reads definitions from a real MCP server and checks them on every call (see "MCP proxy") |
 | Crash recovery | Resume a run from a Postgres checkpoint (LangGraph) | Tested with a hard-killed worker, including the repeat-effect cases below |
 | Tracing | Every run can be inspected end to end (OpenTelemetry) | Planned |
 | Eval gate | Block a release if the agent got measurably worse | Harness and gate built and tested with scripted models; **no real model has been run yet, so there are no results** (see "Evals") |
@@ -69,9 +69,10 @@ The same policy engine is reached through several entry points, so the rules are
 1. **Python library**: a guarded LangGraph agent loop where every tool call goes through the policy, approval and ledger (first version built; see `src/portcullis/agent.py`).
 2. **Server** (first version built, see below): a FastAPI service where an agent runtime asks before each tool call, a human approves or denies the pending ones, and everything lands in the Postgres audit log.
 3. **CLI** (`agentctl`, first version built, see below): verify and read an audit chain, dry-run a policy. Approving actions from the CLI is not built.
-4. **Skill**: a portable `SKILL.md` folder for coding agents that support the open skill format.
+4. **Skill** (built): `skill/portcullis/SKILL.md`, a portable skill file for coding agents. It teaches an agent to check a call with `agentctl check` first, what each refusal code means, and not to retry, reword, split or route around a refusal. A test checks that every rule code it names is one the code really produces.
 5. **Claude Code plugin** (first version built, see below): a `PreToolUse` hook checks each tool call against the policy and answers deny or ask. It fails closed, so an error blocks the call instead of letting it through.
 6. **Dashboard** (built, see "Server"): approvals, audit log and eval report in the browser, served by the server itself as plain HTML and JavaScript with no build step.
+7. **MCP proxy** (built, see "MCP proxy"): put the policy in front of any MCP server.
 
 ## Demo domain
 
@@ -108,6 +109,28 @@ claude --plugin-dir ./plugin
 Protect the policy itself. The example denies file tools from writing `.portcullis/` and the hook, but the `Bash` tool can edit any file, so the policy cannot fully protect itself. Make the policy file read-only or owned by another user, which is the real control. For the same reason `Grep` and `Glob` can still surface secrets by searching a directory; keep secrets out of the project folder. Other settings: `PORTCULLIS_POLICY` (policy path) and `PORTCULLIS_TENANT` (default `claude-code`).
 
 Checked with a real Claude Code session on Windows: a read of a normal file went through, a read of a file named `.env` was refused with the reason above, and both decisions appeared in the audit chain.
+
+## MCP proxy
+
+A proxy that puts the policy in front of any MCP server, so MCP-capable agents (Claude Code, agent frameworks) can be governed without code changes. Install with `uv sync --extra mcp`.
+
+```bash
+# 1. read the tool descriptions and get the hash of each one you are happy with
+uv run python -m portcullis.mcp_proxy pin -- <command that starts the MCP server>
+# 2. put those hashes in the policy as `pinned_sha256`, then run the proxy instead of the server
+uv run python -m portcullis.mcp_proxy serve --policy policy.json --tenant NAME [--audit] -- <command>
+```
+
+Point the MCP client at the second command. The proxy starts the real server itself.
+
+- **Listing.** Only tools the policy names are shown, each with only the pinned fields (name, description, input schema); titles, annotations, icons and metadata are dropped, because they could change unnoticed and some clients act on them. A pinned tool is shown only while its definition still hashes to the pin, so a description changed after you reviewed it is hidden.
+- **Every call is decided first,** by the same deterministic engine: allowlist, argument rules, amounts, step, time and loop budgets, spend cap. The definition is fetched fresh for each call, so a rug pull in the middle of a session is caught on its next call. A refused call never reaches the real server, and the model is told only the rule code.
+- **Approval goes through the client.** A call that needs a human becomes an MCP "input required" round trip: the client shows its user the call, and sends the answer back with the call. The answer is bound to that exact call by a signed, expiring (5 minutes) and single-use token, and the rules are checked again when it arrives. A client that cannot ask its user cannot approve anything; the call fails. Arguments that matched a sensitive pattern are not repeated in the prompt. **A person cannot approve what they cannot see:** arguments longer than 2000 characters are refused rather than asked about (padding must not push the dangerous part out of the prompt), and every prompt carries a short hash and the length of the arguments so a client can check what it displays. Approval prompts are counted, written to the record and capped (three times `max_steps`), so an injected model cannot wear a person down with endless prompts.
+- **Approval is only as strong as the client.** The answer comes from the client, so a compromised client can fabricate "the user said yes". The token proves the call was asked about, not that a person answered. For a human decision a client cannot fake, use the server's approvals and dashboard.
+- **Record.** With `--audit` and `PORTCULLIS_DATABASE_URL`, every decision (and the human's answer) is written to the hash-chained log before the call runs, and a failed write refuses the call. Read a session with `agentctl`'s `show` using the run name printed in the log.
+- **Verified how.** In-process with the SDK's own client and a real MCP server (listing, calls, refusals, approval accepted and declined, a client that cannot ask), against a fake server for rug pulls and failures, and as a real subprocess over stdio. Built on the `mcp` SDK 2.3. It has not been tried with a third-party MCP server or with Claude Code itself.
+- **Failure handling.** A downstream server that does not list its tools within 10 seconds, or fails to, makes calls refuse instead of hang. Arguments over 1 MB are refused. The audit write runs on a thread so a slow database cannot freeze the proxy, and a dropped database connection is replaced once. `--env NAME` passes a named environment variable to the real server (the value comes from the proxy's own environment, never from the command line). `max_spend_per_day` is not enforced by the proxy (it only counts one session); it warns at startup.
+- **Limits.** A tool's result goes back unchanged and may carry a prompt injection; the proxy cannot see it. A pin proves a definition is the one you reviewed, not that it is safe. State (steps, loops, spend, time) is per proxy process, which is one session, and tokens are not counted. Only tools are proxied, not resources or prompts. The approver is recorded as `mcp-client-user`, because the proxy cannot know who the client's user is.
 
 ## Attack suite
 
@@ -221,7 +244,7 @@ Teams that run agents with real side effects and need control and evidence: mult
 - LangGraph's checkpoint serializer rejects integers beyond 64 bits and very deep nesting, so the agent loop accepts only plain JSON tool arguments (string keys, 64-bit integers, at most 32 levels deep) and treats anything else as an invalid call.
 - All malformed tool calls share one loop fingerprint, so a run with `max_identical_calls` of them is halted as a loop.
 - The ledger call id is the message and call position in the checkpointed history, not the model's tool-call id, so a model that reuses ids cannot collide with the ledger.
-- A pin proves a tool's definition is the one you reviewed, not that it is safe or that the server behind it does what the definition says. If a definition changes while a call waits for approval, the call is stopped with an `AuditConflict` error rather than run. Definitions are not read from a real MCP server yet.
+- A pin proves a tool's definition is the one you reviewed, not that it is safe or that the server behind it does what the definition says. If a definition changes while a call waits for approval, the call is stopped with an `AuditConflict` error rather than run. The MCP proxy reads definitions from a real MCP server; the library agent loop still takes them from a function you supply.
 - The engine trusts its caller for the tenant and for the hash of the live tool definition. These must come from the runtime (authenticated identity, the real MCP definition), never from model output.
 
 ## Stack
@@ -233,7 +256,7 @@ In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, 
 1. Policy engine, fake LLM, tests, HTTP server (done)
 2. LangGraph integration, checkpoint and resume, approvals, budgets
 3. Hash-chained audit log and dashboard (done)
-4. MCP surface, CLI and skill, code sandbox
+4. MCP proxy, CLI and skill (done); code sandbox (not built)
 5. Eval gate (harness built; waiting for a first real run), three-surface comparison
 6. Claude Code plugin and demo
 7. Executable attack suite (done: see "Attack suite"; it also lists the gaps it found)
