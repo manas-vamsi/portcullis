@@ -152,13 +152,13 @@ def test_a_failure_while_writing_the_answer_still_blocks(policy_file, monkeypatc
     assert main() == 2  # an uncaught error would exit 1, which lets the call through
 
 
-def test_the_default_policy_is_found_from_the_project_dir_not_the_current_folder(tmp_path, policy_file):
+def test_the_default_policy_is_found_from_the_project_dir_not_the_current_folder(tmp_path, policy_file, monkeypatch):
     project = tmp_path / "project"
     (project / ".portcullis").mkdir(parents=True)
     (project / ".portcullis" / "policy.json").write_text(POLICY.model_dump_json(), encoding="utf-8")
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    os.chdir(elsewhere)
+    monkeypatch.chdir(elsewhere)  # restored afterwards, so later tests still see the project folder
 
     code, out, err = run(event("Read", {"file_path": "a"}), {"CLAUDE_PROJECT_DIR": str(project)})
 
