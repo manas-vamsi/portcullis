@@ -13,10 +13,16 @@ Rules it keeps, because the model's output and the network are untrusted:
 - Tool-call arguments that are not a JSON object are passed on as they are, so the agent refuses the
   call (`invalid_tool_call`) instead of this adapter guessing what the model meant.
 - Errors report the HTTP status or the kind of failure only, never the response body or the URL.
+- A hostile or broken server cannot use unbounded memory or time: the answer is read in pieces under
+  a size cap (after decompression) and a total deadline that is checked as bytes arrive, absurdly
+  nested JSON is an error, and an answer with too many tool calls is an error. Proxy settings from
+  the environment are ignored so the key cannot be routed through a proxy by accident.
 """
 
 import json
 import os
+import time
+import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 from urllib.parse import urlparse
@@ -26,6 +32,8 @@ import httpx
 from portcullis.llm import Messages, Response
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+MAX_RESPONSE_BYTES = 1_048_576  # counted after decompression, so a small gzip bomb is caught too
+MAX_TOOL_CALLS = 16  # in one answer; every call costs a database write and a message in the agent
 
 
 class LLMError(Exception):
@@ -79,16 +87,17 @@ def _parse_arguments(raw: Any) -> Any:
     return raw
 
 
-def _parse_call(raw: Any, index: int) -> dict[str, Any]:
+def _parse_call(raw: Any) -> dict[str, Any]:
     function = raw.get("function") if isinstance(raw, dict) else None
     call_id = raw.get("id") if isinstance(raw, dict) else None
-    call_id = call_id if isinstance(call_id, str) and call_id else f"call-{index}"  # some servers omit ids
+    # Some servers omit ids. A fresh one each time, so ids never repeat across turns in the history.
+    call_id = call_id if isinstance(call_id, str) and call_id else f"call-{uuid.uuid4().hex[:12]}"
     if not isinstance(function, dict):
         return {"id": call_id, "name": None, "args": None}  # malformed: the agent refuses it
     return {"id": call_id, "name": function.get("name"), "args": _parse_arguments(function.get("arguments"))}
 
 
-def _parse_answer(body: Any) -> Response:
+def _parse_answer(body: Any, max_tool_calls: int) -> Response:
     try:
         message = body["choices"][0]["message"]
         tokens = body["usage"]["total_tokens"]
@@ -101,10 +110,12 @@ def _parse_answer(body: Any) -> Response:
     calls = message.get("tool_calls") or []
     if not isinstance(calls, list):
         raise LLMError("the answer's tool_calls is not a list")
+    if len(calls) > max_tool_calls:
+        raise LLMError(f"the answer has more than {max_tool_calls} tool calls")
     content = message.get("content")
     return {
         "content": content if isinstance(content, str) else "",
-        "tool_calls": [_parse_call(raw, index) for index, raw in enumerate(calls)],
+        "tool_calls": [_parse_call(raw) for raw in calls],
         "tokens": tokens,
     }
 
@@ -122,13 +133,17 @@ class OpenAICompatLLM:
         temperature: float = 0.0,
         max_tokens: int = 1024,
         timeout: float = 60.0,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
+        max_tool_calls: int = MAX_TOOL_CALLS,
         client: httpx.Client | None = None,
     ) -> None:
         self._url = _check_base_url(base_url)
         self._model, self._tools = model, [dict(t) for t in tools]
         self._key_env, self._system_prompt = api_key_env, system_prompt
         self._temperature, self._max_tokens = temperature, max_tokens
-        self._client = client or httpx.Client(timeout=timeout)  # follow_redirects stays off: the key must not follow a redirect
+        self._timeout, self._max_bytes, self._max_calls = timeout, max_response_bytes, max_tool_calls
+        # follow_redirects stays off (the key must not follow a redirect); trust_env is off so proxy variables are ignored.
+        self._client = client or httpx.Client(timeout=timeout, trust_env=False)
 
     def __repr__(self) -> str:
         return f"OpenAICompatLLM(base_url={self._url!r}, model={self._model!r}, api_key_env={self._key_env!r})"
@@ -151,16 +166,32 @@ class OpenAICompatLLM:
         if self._tools:
             payload["tools"] = [{"type": "function", "function": t} for t in self._tools]
             payload["tool_choice"] = "auto"
+        deadline = time.monotonic() + self._timeout
         try:
-            response = self._client.post(f"{self._url}/chat/completions", json=payload, headers=self._headers())
+            with self._client.stream(
+                "POST", f"{self._url}/chat/completions", json=payload, headers=self._headers()
+            ) as response:
+                if response.status_code != 200:
+                    raise LLMError(f"the server answered HTTP {response.status_code}")
+                raw = self._read(response, deadline)
         except httpx.TimeoutException as exc:
             raise LLMError("the request timed out") from exc
         except httpx.HTTPError as exc:
             raise LLMError(f"could not reach the server ({type(exc).__name__})") from exc
-        if response.status_code != 200:
-            raise LLMError(f"the server answered HTTP {response.status_code}")
         try:
-            body = response.json()
-        except ValueError as exc:
+            body = json.loads(raw)
+        except (ValueError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
             raise LLMError("the server's answer is not JSON") from exc
-        return _parse_answer(body)
+        return _parse_answer(body, self._max_calls)
+
+    def _read(self, response: httpx.Response, deadline: float) -> bytes:
+        """The body, refused if it grows past the size cap or the deadline passes while it arrives."""
+        chunks, size = [], 0
+        for chunk in response.iter_bytes():
+            size += len(chunk)
+            if size > self._max_bytes:
+                raise LLMError("the answer is too large")
+            if time.monotonic() > deadline:
+                raise LLMError("the request timed out")
+            chunks.append(chunk)
+        return b"".join(chunks)

@@ -1,6 +1,8 @@
 """The OpenAI-compatible adapter, tested against an in-memory fake server (no network, no key)."""
 
 import json
+import re
+import time
 
 import httpx
 import pytest
@@ -129,7 +131,10 @@ def test_arguments_that_are_not_a_json_object_are_passed_on_unparsed_so_the_agen
 def test_a_call_without_an_id_gets_one():
     bare = {"type": "function", "function": {"name": "check_vendor_availability", "arguments": "{}"}}
     reply = llm(FakeServer(completion(None, [bare, bare])))([{"role": "user", "content": "x"}])
-    assert [c["id"] for c in reply["tool_calls"]] == ["call-0", "call-1"]
+    ids = [c["id"] for c in reply["tool_calls"]]
+    assert all(re.fullmatch(r"call-[0-9a-f]{12}", i) for i in ids) and len(set(ids)) == 2
+    again = llm(FakeServer(completion(None, [bare])))([{"role": "user", "content": "x"}])
+    assert again["tool_calls"][0]["id"] not in ids  # not reused on a later turn either
 
 
 def test_arguments_sent_as_an_object_instead_of_a_string_are_accepted():
@@ -267,3 +272,68 @@ def test_a_model_that_returns_garbage_arguments_is_refused_by_the_agent_not_cras
     final = agent.invoke(initial_state("acme", run_id, "x"), {"configurable": {"thread_id": run_id}})
 
     assert tool_results(final) == [{"error": "invalid_tool_call"}]
+
+
+# --- a hostile or broken server ---
+
+
+class Drip(httpx.SyncByteStream):
+    """A body that arrives slowly, a chunk at a time."""
+
+    def __init__(self, chunks, pause):
+        self.chunks, self.pause = chunks, pause
+
+    def __iter__(self):
+        for chunk in self.chunks:
+            time.sleep(self.pause)
+            yield chunk
+
+
+def test_an_answer_that_is_too_large_is_refused_while_it_is_read():
+    huge = {"choices": [{"message": {"content": "x" * 5000}}], "usage": {"total_tokens": 1}}
+    with pytest.raises(LLMError, match="too large"):
+        llm(FakeServer(huge), max_response_bytes=1000)([{"role": "user", "content": "x"}])
+
+
+def test_an_answer_that_is_a_small_download_but_huge_when_decompressed_is_refused():
+    import gzip
+
+    bomb = gzip.compress(json.dumps({"choices": [{"message": {"content": "x" * 2_000_000}}], "usage": {"total_tokens": 1}}).encode())
+    assert len(bomb) < 5000
+
+    def serve(request):
+        return httpx.Response(200, content=bomb, headers={"content-encoding": "gzip"})
+
+    with pytest.raises(LLMError, match="too large"):
+        llm(serve)([{"role": "user", "content": "x"}])
+
+
+def test_an_answer_that_trickles_in_is_cut_off_by_a_total_deadline():
+    body = json.dumps(completion("hi")).encode()
+    pieces = [body[i : i + 5] for i in range(0, len(body), 5)]
+
+    def serve(request):
+        return httpx.Response(200, stream=Drip(pieces, 0.05))
+
+    with pytest.raises(LLMError, match="timed out"):
+        llm(serve, timeout=0.2)([{"role": "user", "content": "x"}])
+
+
+@pytest.mark.parametrize("body", [b"[" * 200_000, b'{"a":' * 100_000], ids=["nested_lists", "nested_objects"])
+def test_absurdly_nested_json_is_an_error_not_a_crash(body):
+    with pytest.raises(LLMError, match="not JSON"):
+        llm(lambda request: httpx.Response(200, content=body))([{"role": "user", "content": "x"}])
+
+
+def test_too_many_tool_calls_in_one_answer_is_an_error():
+    many = [tool_call(f"c{i}") for i in range(17)]
+    with pytest.raises(LLMError, match="tool calls"):
+        llm(FakeServer(completion(None, many)))([{"role": "user", "content": "x"}])
+    ok = [tool_call(f"c{i}") for i in range(16)]
+    assert len(llm(FakeServer(completion(None, ok)))([{"role": "user", "content": "x"}])["tool_calls"]) == 16
+
+
+def test_the_default_client_ignores_proxy_settings_so_the_key_cannot_be_sent_to_one(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.test:3128")
+    adapter = OpenAICompatLLM(base_url="https://api.example.test/v1", model="m", api_key_env="TEST_KEY")
+    assert adapter._client._trust_env is False
