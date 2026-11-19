@@ -213,6 +213,36 @@ uv run agentctl keygen --tenant acme --role approver --name alice
   - *Limits.* It is a thin viewer, not a product: no login or sessions (the key is the identity), no live updates beyond an optional 10-second refresh, and it was not tested in a real browser (the browser extension was not available), so expect cosmetic rough edges.
 - Read a server run with `agentctl verify RUN --tenant acme --rows N --head HASH`; a Claude Code session recorded by the hook with `agentctl verify SESSION_ID --hook`.
 
+## Measured costs
+
+Measured with `benchmarks/run.py` on one machine (Windows-11-10.0.26300-SP0, Intel64 Family 6 Model 186 Stepping 3, 12 logical CPUs, Python 3.12.0, Postgres 16.14 in a local Docker container, 2026-11-19). The raw numbers are in `benchmarks/results/`. They are single-machine, single-run figures: the server and its client share the CPU, Postgres is on loopback, and there is no load test. They say what the order of magnitude is here, not what it will be on your hardware. No model is involved in any of them.
+
+| What | Median | 95th percentile | Notes |
+|---|---|---|---|
+| One policy decision, in process | 9 microseconds to 11 microseconds | 31 microseconds at most | four kinds of call, 50,000 samples each |
+| Appending one audit row | 11.9 ms | 16.7 ms | about 81 rows a second from one writer (a transaction and a lock per row) |
+| Verifying a chain | 17 microseconds a row | | 3,000 rows in 51 ms |
+| Server decision, run of 10 calls | 25.8 ms | 31.1 ms | over real HTTP on loopback, with the database |
+| Server decision, run of 100 calls | 34.7 ms | 46.9 ms | |
+| Server decision, run of 500 calls | 52.8 ms | 70.4 ms | |
+| Server decision, run of 1000 calls | 78.4 ms | 102.4 ms | the cost grows with the run: its history is rebuilt from its log each time |
+| Claude Code hook, no database | 658 ms | 751 ms | a fresh process per call, as Claude Code runs it |
+| Claude Code hook, with a database | 1014 ms | 1104 ms | adds the database driver import, a connection and the session's history |
+| MCP proxy, one tool call | adds 2.5 ms | | 1.6 ms direct, 4.1 ms through the proxy, in memory; includes listing the real server's tools on every call |
+
+What this says in plain words:
+
+- **The policy is not the cost.** A decision takes about ten microseconds. What costs time is everything around it: a database write per decision (about 12 ms), and starting a process per call in the hook.
+- **The hook is the weak spot.** About 0.7 seconds a call without a database and about 1.0 seconds with one is noticeable on every tool call. Earlier profiling on this machine put most of it in process start-up and library imports (Pydantic, and the database driver when a database is set), not in decisions; this benchmark run did not profile it again. A long-running process instead of one per call, or a rewrite in a language that starts faster, would fix it; neither is built.
+- **The server slows as a run grows** (about 26 ms at 10 calls to about 78 ms at 1000) because each decision rebuilds the run's state from its whole log. A cache keyed by the log's latest hash would remove most of that; it is not built. See the decision record on state.
+- **Not measured:** anything with a real model, concurrent load, other hardware, a remote database, TLS, or the dashboard. Do not quote these numbers for any of those.
+
+Rerun with `uv run --env-file .env python benchmarks/run.py --out results.json` (`--quick` is a smoke test, not a measurement). It removes every row it writes.
+
+## Decision records
+
+The decisions that shape the design (why the policy is deterministic, why everything fails closed, why state lives in the audit chain, what each approval channel is worth, and what each decision costs) are short records in [`docs/adr/`](docs/adr/README.md). A test checks that each has the same sections, that every file it names exists, and that none claims exactly-once delivery or tamper-proofness.
+
 ## Research question
 
 MCP servers, CLI plus skills, and code execution are three common ways to give an agent tools. The plan is to expose the same tools all three ways under one policy layer and measure, on the demo agent: pass^k, tokens, tool calls, latency, cost and attacks blocked. **No results exist yet.** Numbers will be published only after they are measured.
@@ -236,7 +266,7 @@ Teams that run agents with real side effects and need control and evidence: mult
 - Delivery is at-least-once, not exactly-once. If the process dies after a tool call but before the ledger records it, the call is retried with the same idempotency key. The outside service must deduplicate by that key; one that ignores keys can see one duplicate. A test pins this.
 - The audit log is tamper-evident, not tamper-proof. Editing or deleting a row inside a run's chain is detected. Deleting the last rows or a whole run is not, unless you keep the head hash somewhere else. Someone with database write access can rewrite a whole chain. It stores a hash of each request, not the arguments.
 - The Claude Code hook is stateless unless `PORTCULLIS_DATABASE_URL` is set; then it enforces the step and time budgets and loop detection per session (tokens and spend do not apply to it). An `ask` is answered inside Claude Code, which does not tell the hook what the user chose, so approvals are not recorded there.
-- The hook adds delay to every tool call. Measured on one Windows laptop (i7-1355U), a call takes about 0.5 to 0.8 seconds, most of it importing Pydantic; importing the database driver is skipped unless auditing is on. A faster implementation (the plan mentions a Rust CLI) is not built, and these numbers are from one machine.
+- The hook adds delay to every tool call: a median of 658 ms without a database and 1014 ms with one, measured on one machine (see "Measured costs"). Earlier profiling put most of it in starting a process and importing libraries on every call (not re-profiled in the latest run). A long-running process or a faster-starting implementation would fix it and is not built.
 - Argument rules are regexes written by the policy author and run on text the model controls. Python's `re` has no timeout, so avoid nested quantifiers. Arguments over 10,000 characters are denied instead of inspected. A pattern list is only as good as its author.
 - An empty audit chain and a missing one look the same to `verify()`, so check the row count or head hash against what you expect. Reusing an event id for different content raises an error instead of being deduplicated.
 - A call that keeps failing is retried on every resume. There is no per-call retry cap yet.
@@ -260,7 +290,7 @@ In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, 
 5. Eval gate (harness built; waiting for a first real run), three-surface comparison
 6. Claude Code plugin and demo
 7. Executable attack suite (done: see "Attack suite"; it also lists the gaps it found)
-8. Benchmarks, architecture decision records, docs
+8. Benchmarks (done: see "Measured costs"; no model is involved), architecture decision records (done), docs
 
 ## Getting started
 
