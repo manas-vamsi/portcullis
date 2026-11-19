@@ -1,5 +1,6 @@
 """The property-maintenance triage demo: synthetic data, scripted model, real policy, ledger and audit log."""
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -179,3 +180,26 @@ def test_the_command_line_needs_a_database_url(capsys, monkeypatch):
 
     assert main(["--scenario", "routine"]) == 2
     assert "PORTCULLIS_DATABASE_URL" in capsys.readouterr().err
+
+
+def test_the_tool_log_is_matched_by_position_so_reused_call_ids_cannot_mislabel_a_tool():
+    from portcullis.demo import _tool_log
+
+    calls = lambda *names: {"role": "assistant", "tool_calls": [{"id": "same", "name": n} for n in names]}  # noqa: E731
+    tool = lambda content: {"role": "tool", "tool_call_id": "same", "content": json.dumps(content)}  # noqa: E731
+    messages = [
+        {"role": "user", "content": "x"},
+        calls("check_vendor_availability"),
+        tool({"result": {}}),
+        calls("create_work_order", "notify_tenant"),
+        tool({"error": "approval_denied"}),
+        tool({"result": {}}),
+        {"role": "assistant", "tool_calls": []},
+        tool({"result": {}}),  # a stray tool message with no call before it
+    ]
+    assert _tool_log(messages) == (
+        "check_vendor_availability: ok",
+        "create_work_order: approval_denied",
+        "notify_tenant: ok",
+        "?: ok",
+    )

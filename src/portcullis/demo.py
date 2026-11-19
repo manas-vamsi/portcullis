@@ -193,14 +193,20 @@ class TriageResult:
     pending: dict[str, Any] | None
     final_message: str
     audit: Verification
+    tokens: int = 0  # as reported by the model adapter
+    steps: int = 0  # tool calls decided, allowed or not
 
 
 def _tool_log(messages: Sequence[dict[str, Any]]) -> tuple[str, ...]:
-    names = {call["id"]: call.get("name", "?") for m in messages for call in m.get("tool_calls", [])}
-    lines = []
-    for message in (m for m in messages if m["role"] == "tool"):
-        content = json.loads(message["content"])
-        lines.append(f"{names.get(message['tool_call_id'], '?')}: {content.get('error') or 'ok'}")
+    """One "tool: result" line per tool message. Matched by position within the turn, never by the model's call id,
+    because a model can reuse ids (across turns, or twice in one) and that would credit the wrong tool."""
+    lines, waiting = [], []
+    for message in messages:
+        if message["role"] == "assistant":
+            waiting = [call.get("name", "?") for call in message.get("tool_calls", [])]
+        elif message["role"] == "tool":
+            name = waiting.pop(0) if waiting else "?"
+            lines.append(f"{name}: {json.loads(message['content']).get('error') or 'ok'}")
     return tuple(lines)
 
 
@@ -239,10 +245,13 @@ def triage(
         pending,
         replies[-1] if replies else "",
         verify(conn, run_id),
+        state["tokens"],
+        state["steps"],
     )
 
 
-def _answer(kind: str | None) -> Callable[[dict[str, Any]], Any] | None:
+def human_answer(kind: str | None) -> Callable[[dict[str, Any]], Any] | None:
+    """The property manager's answer to an approval request: 'approve', 'deny', or None for no one."""
     if kind is None:
         return None
     approved = kind == "approve"
@@ -289,7 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scenario = SCENARIOS[name]
             result = triage(
                 conn, FakeLLM(scenario.script), scenario.request, f"demo-{uuid.uuid4().hex[:8]}", PropertyOps(),
-                approver=_answer(scenario.human),
+                approver=human_answer(scenario.human),
             )
             _print_result(name, scenario, result)
             all_verified = all_verified and result.audit.ok
