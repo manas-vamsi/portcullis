@@ -1,7 +1,7 @@
 """An LLM adapter for any OpenAI-compatible chat API.
 
-Ollama (local), Groq, OpenRouter, Gemini's compatibility endpoint and OpenAI itself all speak this
-format, so one adapter covers the free options and costs nothing to keep. It turns the agent's
+Ollama (local) and several hosted providers say they accept this format, so one adapter should cover
+the free options. It has only been tested against a fake server, not against any real provider. It turns the agent's
 message history into a chat request and the answer back into the agent's reply dict.
 
 Rules it keeps, because the model's output and the network are untrusted:
