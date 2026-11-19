@@ -55,6 +55,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from portcullis import tracing
 from portcullis.audit import AuditTrail
 from portcullis.idempotency import idempotency_key, run_once
 from portcullis.jsondata import MAX_INT, check_json
@@ -326,7 +327,9 @@ def make_tools_node(
             )
             seen = _live_hash(definitions, name) if call else None
             tool_call = ToolCall(tenant_id=state["tenant_id"], tool=name, args=args, definition_sha256=seen)
-            decision = decide(policy, tool_call, run_state)
+            with tracing.span("portcullis.decide", surface="agent", tenant=state["tenant_id"], tool=name, run=state["run_id"]):
+                decision = decide(policy, tool_call, run_state)
+                tracing.annotate(verdict=decision.verdict.value, rule=decision.rule)
             _log_decision(trail, position_id, name, args, decision, seen)  # written before anything runs
             steps += 1
             history.append(fingerprint(name, args))

@@ -41,6 +41,8 @@ Trust and limits
   from the runtime, never from model output.
 - Plain HTTP on loopback by default: put TLS in front of it. The new-run limit is kept in memory,
   per process.
+- Decisions and approvals are traced when OpenTelemetry is set up (tracing.py): a fixed list of
+  non-sensitive attributes, never the arguments.
 - The dashboard (dashboard.py) is served at /dashboard/ and holds no data of its own: it calls this API
   with the key you type, and shows everything from the log as text only.
 """
@@ -73,7 +75,7 @@ from portcullis.audit import (
     read_verified,
     require_project_database,
 )
-from portcullis import dashboard
+from portcullis import dashboard, tracing
 from portcullis.hook import HookError, load_policy
 from portcullis.jsondata import MAX_INT, check_json
 from portcullis.keys import KeyEntry, Principal, authenticate, load_keys
@@ -247,6 +249,21 @@ class Gateway:
         definition_sha256: str | None,
         tokens: int = 0,
     ) -> dict[str, Any]:
+        with tracing.span("portcullis.decide", surface="server", tenant=tenant, tool=tool, run=run_id):
+            result = self._decide_call(tenant, run_id, call_id, tool, args, definition_sha256, tokens)
+            tracing.annotate(status=result["status"], rule=result["rule"])
+            return result
+
+    def _decide_call(
+        self,
+        tenant: str,
+        run_id: str,
+        call_id: str,
+        tool: str,
+        args: dict[str, Any],
+        definition_sha256: str | None,
+        tokens: int,
+    ) -> dict[str, Any]:
         run, request_sha256 = namespaced(tenant, run_id), fingerprint(tool, args)
         call = ToolCall(tenant_id=tenant, tool=tool, args=args, definition_sha256=definition_sha256)
         with self._locked_run(tenant, run) as conn:
@@ -313,6 +330,12 @@ class Gateway:
             return view(record)
 
     def answer(self, tenant: str, run_id: str, call_id: str, approved: bool, by: str) -> dict[str, Any]:
+        with tracing.span("portcullis.approval", surface="server", tenant=tenant, run=run_id, approved=approved):
+            result = self._answer(tenant, run_id, call_id, approved, by)
+            tracing.annotate(status=result["status"])  # who answered is in the audit log, not in traces
+            return result
+
+    def _answer(self, tenant: str, run_id: str, call_id: str, approved: bool, by: str) -> dict[str, Any]:
         run = namespaced(tenant, run_id)
         with self._locked_run(tenant, run) as conn:
             policy = self._policy_of()
@@ -603,6 +626,8 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover
     except (ValueError, ValidationError) as exc:
         print(f"portcullis server: {exc}")
         return 2
+    if tracing.setup_from_env(os.environ) == "configured":
+        print("portcullis server: exporting traces to the OTLP endpoint")
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
 

@@ -47,6 +47,7 @@ from typing import Any, Protocol
 from mcp import types
 from mcp.server.lowlevel import Server
 
+from portcullis import tracing
 from portcullis.audit import mcp_run
 from portcullis.hook import HookError, load_policy
 from portcullis.jsondata import check_json
@@ -166,8 +167,9 @@ class Governor:
 
     async def call_tool(self, ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult | types.InputRequiredResult:
         name, arguments = params.name, params.arguments or {}
-        async with self._lock:
-            outcome = await self._decide_and_record(params, name, arguments)
+        with tracing.span("portcullis.decide", surface="mcp", tenant=self._tenant, tool=name):
+            async with self._lock:
+                outcome = await self._decide_and_record(params, name, arguments)
         if isinstance(outcome, (types.CallToolResult, types.InputRequiredResult)):
             return outcome
         try:  # outside the lock: a slow tool must not hold up the next decision
@@ -186,6 +188,7 @@ class Governor:
         except ConfigUnavailable:
             return _error("Refused: the policy is unavailable")
         decision, call, amount = await self._decision(policy, name, arguments)
+        tracing.annotate(verdict=decision.verdict.value, rule=decision.rule)
         approval: bool | None = None
         if decision.verdict is Verdict.ASK:
             blocked = self._cannot_ask(policy, call)
@@ -400,6 +403,7 @@ async def serve(policy_path: Path, tenant: str, command: list[str], audit: bool,
     from mcp import Client, StdioServerParameters
     from mcp.server.stdio import stdio_server
 
+    tracing.setup_from_env(os.environ)
     reloadable = Reloadable(policy_path, load_policy)
     for warning in warnings_for(reloadable.get(), tenant):
         print(f"portcullis mcp proxy: warning: {warning}", file=sys.stderr)
