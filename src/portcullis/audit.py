@@ -69,6 +69,11 @@ def hook_run(tenant: str, session: str) -> str:
     return json.dumps(["claude-code-hook", tenant, session])
 
 
+def mcp_run(tenant: str, session: str) -> str:
+    """The run name for a session of the MCP proxy. Three parts, like the hook's, so it is never a server run."""
+    return json.dumps(["mcp-proxy", tenant, session])
+
+
 def lock_key(name: str) -> int:
     """A 64-bit advisory lock number for a run: a sha256 prefix, so a client cannot guess or collide it."""
     return int.from_bytes(hashlib.sha256(f"run:{name}".encode()).digest()[:8], "big", signed=True)
