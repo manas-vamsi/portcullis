@@ -224,6 +224,10 @@ Same model, cases, settings and machine, after two changes (commit `cd97363`): t
 - **Runs take longer** because the model now makes more calls and gets refusals it has to answer. The two runs were not timed under identical machine load, so treat the time as rough.
 - Results are not fully identical across the three runs any more (the outlet case differed in one run), even at temperature 0.
 
+### A larger model did not fit on this laptop
+
+A third run with `qwen2.5:7b` (4.7 GB) was attempted and did not finish. On this laptop's CPU each model step took about a minute, so the demo's 120-second time budget stopped a smoke-test run (the budget working as intended); the eval command gained `--max-seconds` for that, which replaces only the time budget and is recorded in the results file. The full run with a 10-minute budget was then stopped by the operating environment because the machine ran out of memory (15.7 GB in total, with only a few GB free while Docker and other programs were running). No 7B results exist. Running it needs a machine with more free memory or a GPU.
+
 ## Server
 
 An HTTP service for agent runtimes that are not Python or not LangGraph. Run it with `uv sync --extra server`, then `python -m portcullis.server` (loopback only by default; `--port` to change it).
