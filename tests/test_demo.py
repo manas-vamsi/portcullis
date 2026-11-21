@@ -105,7 +105,7 @@ def test_the_spend_threshold_is_exactly_five_hundred():
     policy = demo_policy()
 
     def verdict(cost):
-        call = ToolCall(tenant_id="demo-property", tool="create_work_order", args={"cost": cost})
+        call = ToolCall(tenant_id="demo-property", tool="create_work_order", args={"cost": cost, "vendor_id": "V-101"})
         return decide(policy, call, RunState()).verdict
 
     assert verdict(500) is Verdict.ALLOW
@@ -203,3 +203,18 @@ def test_the_tool_log_is_matched_by_position_so_reused_call_ids_cannot_mislabel_
         "notify_tenant: ok",
         "?: ok",
     )
+
+
+# --- gaps found by the first real-model eval run ---
+
+
+@pytest.mark.parametrize("vendor", [None, "", "V-", "plumber", "V-101; DROP", "v-101", " V-101"])
+def test_a_work_order_without_a_real_vendor_id_is_refused(vendor):
+    args = {"unit": "12", "description": "faucet", "cost": 100} | ({} if vendor is None else {"vendor_id": vendor})
+    decision = decide(demo_policy(), ToolCall(tenant_id="demo-property", tool="create_work_order", args=args), RunState())
+    assert decision.verdict is Verdict.DENY and decision.rule in ("missing_argument", "forbidden_argument")
+
+
+def test_a_work_order_with_a_real_vendor_id_still_goes_through():
+    args = {"vendor_id": "V-101", "unit": "12", "description": "faucet", "cost": 100}
+    assert decide(demo_policy(), ToolCall(tenant_id="demo-property", tool="create_work_order", args=args), RunState()).verdict is Verdict.ALLOW

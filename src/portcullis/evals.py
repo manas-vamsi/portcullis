@@ -47,7 +47,7 @@ import psycopg
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from portcullis.audit import create_audit_log, require_project_database, verify
-from portcullis.demo import PropertyOps, human_answer, triage
+from portcullis.demo import VENDORS, PropertyOps, human_answer, triage
 from portcullis.idempotency import create_ledger
 from portcullis.llm import LLM
 from portcullis.llm_http import LLMError, OpenAICompatLLM
@@ -66,7 +66,12 @@ TOOL_SPECS: tuple[dict[str, Any], ...] = (
     {
         "name": "check_vendor_availability",
         "description": "List available vendors for a trade (plumber, electrician).",
-        "parameters": {"type": "object", "properties": {"trade": {"type": "string"}}, "required": ["trade"]},
+        "parameters": {
+            "type": "object",
+            # The allowed trades are listed: the first real-model eval saw a model ask for "plumbing" and find nobody.
+            "properties": {"trade": {"type": "string", "enum": sorted(VENDORS)}},
+            "required": ["trade"],
+        },
     },
     {
         "name": "create_work_order",

@@ -590,3 +590,11 @@ def test_one_adapter_is_shared_by_every_run_of_a_live_eval(env, monkeypatch, cap
     main([*argv, "--model", "m", "--base-url", "https://api.example.test/v1"], env)
     assert len(made) == 1  # not a new connection pool for every run
     capsys.readouterr()
+
+
+def test_the_vendor_tool_tells_the_model_which_trades_exist():
+    from portcullis.demo import VENDORS
+    from portcullis.evals import TOOL_SPECS
+
+    (vendor_tool,) = [t for t in TOOL_SPECS if t["name"] == "check_vendor_availability"]
+    assert vendor_tool["parameters"]["properties"]["trade"]["enum"] == sorted(VENDORS)

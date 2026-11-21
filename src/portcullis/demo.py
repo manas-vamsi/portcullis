@@ -28,7 +28,7 @@ from portcullis.agent import Tool, build_agent, initial_state
 from portcullis.audit import AuditTrail, Verification, create_audit_log, require_project_database, verify
 from portcullis.idempotency import create_ledger
 from portcullis.llm import LLM, FakeLLM
-from portcullis.policy import Budget, Policy, Risk, TenantPolicy, Threshold, ToolRule
+from portcullis.policy import ArgPattern, Budget, Policy, Risk, TenantPolicy, Threshold, ToolRule
 
 TENANT = "demo-property"
 APPROVAL_LIMIT = 500  # work orders above this need a human
@@ -111,7 +111,13 @@ class PropertyOps:
 def demo_policy() -> Policy:
     tools = {
         "check_vendor_availability": ToolRule(risk=Risk.READ),
-        "create_work_order": ToolRule(risk=Risk.WRITE, approve_above=Threshold(arg="cost", limit=APPROVAL_LIMIT)),
+        "create_work_order": ToolRule(
+            risk=Risk.WRITE,
+            approve_above=Threshold(arg="cost", limit=APPROVAL_LIMIT),
+            # A vendor id from the directory (V- and digits) is required. The first real-model eval showed a model
+            # booking a job with no vendor at all, which the policy used to allow.
+            deny_if=(ArgPattern(arg="vendor_id", regex=r"^(?!V-[0-9]+$)", required=True),),
+        ),
         "cancel_work_order": ToolRule(risk=Risk.WRITE),
         "notify_tenant": ToolRule(risk=Risk.WRITE),
     }
