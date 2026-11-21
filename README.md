@@ -298,7 +298,7 @@ Teams that run agents with real side effects and need control and evidence: mult
 
 ## Stack
 
-In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, Pydantic v2, pytest, GitHub Actions. Optional: OpenTelemetry for tracing. Planned: Hypothesis. The dashboard is plain HTML and JavaScript with no framework and no third-party code; its logic is tested with Node's built-in test runner. Everything runs locally and needs no paid service.
+In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, Pydantic v2, pytest, GitHub Actions. Optional: OpenTelemetry for tracing. Hypothesis for property tests (`tests/test_properties.py`): rules that must hold for every input, such as "the engine never raises", "deny always beats ask", "no payment past a spend cap is allowed" and "changing any field of any audit row is detected", are checked against thousands of generated inputs on each test run. The dashboard is plain HTML and JavaScript with no framework and no third-party code; its logic is tested with Node's built-in test runner. Everything runs locally and needs no paid service.
 
 ## Roadmap
 
