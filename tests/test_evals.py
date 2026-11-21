@@ -598,3 +598,40 @@ def test_the_vendor_tool_tells_the_model_which_trades_exist():
 
     (vendor_tool,) = [t for t in TOOL_SPECS if t["name"] == "check_vendor_availability"]
     assert vendor_tool["parameters"]["properties"]["trade"]["enum"] == sorted(VENDORS)
+
+
+# --- an eval-only time budget, for slow machines ---
+
+
+def test_the_eval_policy_changes_only_the_time_budget_and_only_when_asked():
+    import portcullis.demo as demo
+
+    assert evals.eval_policy(max_seconds=None) == demo.demo_policy()
+    longer = evals.eval_policy(max_seconds=600)
+    assert longer.tenants[demo.TENANT].budget.max_seconds == 600
+    assert longer.tenants[demo.TENANT].budget.max_steps == demo.demo_policy().tenants[demo.TENANT].budget.max_steps
+    assert longer.tenants[demo.TENANT].tools == demo.demo_policy().tenants[demo.TENANT].tools
+
+
+def test_run_case_uses_the_policy_it_is_given(conn):
+    tight = evals.eval_policy(max_seconds=None).model_copy(deep=True)
+    budget = tight.tenants["demo-property"].budget.model_copy(update={"max_steps": 1})
+    tight = tight.model_copy(update={"tenants": {"demo-property": tight.tenants["demo-property"].model_copy(update={"budget": budget})}})
+    outcome = run_case(conn, script(*BOOK), case(must_run=["create_work_order"]), 0, policy=tight)
+    assert not outcome.passed and outcome.refused.get("budget_exceeded") == 1
+
+
+def test_the_time_budget_override_is_recorded_in_the_results(tmp_path, env):
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps([{"id": "ok", "category": "task", "request": "faucet"}]), encoding="utf-8")
+    out = tmp_path / "r.json"
+    main(["run", "--cases", str(cases), "--model", "m", "--max-seconds", "600", "--out", str(out)], env, llm_for=lambda c: script("hi"))
+    assert json.loads(out.read_text(encoding="utf-8"))["meta"]["max_seconds"] == 600
+    main(["run", "--cases", str(cases), "--model", "m", "--out", str(out)], env, llm_for=lambda c: script("hi"))
+    assert json.loads(out.read_text(encoding="utf-8"))["meta"]["max_seconds"] is None  # none given: the demo's own
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "nan", "inf", "abc"])
+def test_a_time_budget_must_be_a_positive_finite_number(value, env, capsys):
+    assert main(["run", "--model", "m", "--max-seconds", value], env, llm_for=lambda c: script()) == 2
+    capsys.readouterr()

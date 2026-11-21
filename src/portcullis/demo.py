@@ -224,6 +224,7 @@ def triage(
     ops: PropertyOps,
     approver: Callable[[dict[str, Any]], Any] | None = None,
     tenant: str = TENANT,
+    policy: Policy | None = None,
 ) -> TriageResult:
     """Handle one maintenance request. `approver` answers approval requests; without it the run stops there."""
     keyword = find_emergency(request)
@@ -234,7 +235,7 @@ def triage(
         message = f"Escalated to a human ({keyword}). Call the emergency line now."
         return TriageResult(run_id, "escalated", (), (), None, message, verify(conn, run_id))
 
-    agent = build_agent(llm, demo_policy(), ops.tools(), conn, InMemorySaver())
+    agent = build_agent(llm, policy or demo_policy(), ops.tools(), conn, InMemorySaver())
     config = {"configurable": {"thread_id": run_id}}
     state = agent.invoke(initial_state(tenant, run_id, request), config)
     while "__interrupt__" in state and approver is not None:

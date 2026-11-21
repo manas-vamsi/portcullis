@@ -47,10 +47,11 @@ import psycopg
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from portcullis.audit import create_audit_log, require_project_database, verify
-from portcullis.demo import VENDORS, PropertyOps, human_answer, triage
+from portcullis.demo import TENANT, VENDORS, PropertyOps, demo_policy, human_answer, triage
 from portcullis.idempotency import create_ledger
 from portcullis.llm import LLM
 from portcullis.llm_http import LLMError, OpenAICompatLLM
+from portcullis.policy import Policy
 
 DEFAULT_CASES = Path("evals/cases.json")
 EXIT_OK, EXIT_FAIL, EXIT_ERROR = 0, 1, 2
@@ -227,12 +228,24 @@ def _error_outcome(
     )
 
 
-def run_case(conn: psycopg.Connection, llm: LLM, case: Case, index: int, keep_audit: bool = False) -> Outcome:
+def eval_policy(max_seconds: float | None) -> Policy:
+    """The demo policy, with only its time budget replaced when one is given (for slow machines; recorded in the results)."""
+    policy = demo_policy()
+    if max_seconds is None:
+        return policy
+    tenant = policy.tenants[TENANT]
+    budget = tenant.budget.model_copy(update={"max_seconds": max_seconds})
+    return Policy(tenants={TENANT: tenant.model_copy(update={"budget": budget})})
+
+
+def run_case(
+    conn: psycopg.Connection, llm: LLM, case: Case, index: int, keep_audit: bool = False, policy: Policy | None = None
+) -> Outcome:
     """One run of one case. A model or network failure becomes an `error` outcome instead of stopping the eval."""
     run_id, ops, started = f"eval-{uuid.uuid4().hex[:12]}", PropertyOps(), time.perf_counter()
     base: dict[str, Any] = {"case_id": case.id, "category": case.category, "run": index, "run_id": run_id}
     try:
-        result = triage(conn, llm, case.request, run_id, ops, approver=human_answer(case.human))
+        result = triage(conn, llm, case.request, run_id, ops, approver=human_answer(case.human), policy=policy)
         pairs = [line.rsplit(": ", 1) for line in result.tool_log]
         executed = tuple(name for name, outcome in pairs if outcome == "ok")
         cost = _total_cost(ops)
@@ -371,6 +384,7 @@ def _run(args: argparse.Namespace, env: Mapping[str, str], llm_for: Callable[[Ca
     except ValueError as exc:
         raise EvalError(str(exc)) from exc
     make_llm = llm_for or _live_llm_for(args)
+    policy = eval_policy(args.max_seconds)
 
     outcomes = []
     with psycopg.connect(url, autocommit=True) as conn:
@@ -378,7 +392,7 @@ def _run(args: argparse.Namespace, env: Mapping[str, str], llm_for: Callable[[Ca
         create_audit_log(conn)
         for case in cases:
             for index in range(args.runs):
-                outcomes.append(run_case(conn, make_llm(case), case, index, keep_audit=args.keep_audit))
+                outcomes.append(run_case(conn, make_llm(case), case, index, keep_audit=args.keep_audit, policy=policy))
     summary = summarize(outcomes)
     _report(outcomes, summary)
     if args.out:
@@ -395,6 +409,7 @@ def _write_results(out: Path, args: argparse.Namespace, outcomes: Sequence[Outco
         "endpoint_host": urlparse(args.base_url).hostname if args.base_url else None,
         "temperature": args.temperature,
         "runs_per_case": args.runs,
+        "max_seconds": args.max_seconds,  # None: the demo policy's own time budget
         "cases_sha256": hashlib.sha256(Path(args.cases).read_bytes()).hexdigest(),
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -431,6 +446,17 @@ def _gate(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _positive_float(text: str) -> float:
+    """A time budget: a finite number above zero."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not (math.isfinite(value) and value > 0):
+        raise argparse.ArgumentTypeError(f"{text!r} must be a number above zero")
+    return value
+
+
 def _unit_float(text: str) -> float:
     """A threshold: a finite number from 0 to 1. nan, inf and negatives would let a gate pass by accident."""
     try:
@@ -455,6 +481,8 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--api-key-env", help="the NAME of the environment variable that holds the API key")
     run.add_argument("--temperature", type=float, default=0.0)
     run.add_argument("--timeout", type=float, default=60.0)
+    run.add_argument("--max-seconds", type=_positive_float, default=None,
+                     help="replace the demo policy's time budget per run (for slow machines); recorded in the results")
     run.add_argument("--out", help="write the outcomes and summary to this JSON file")
     run.add_argument("--keep-audit", action="store_true", help="keep each run's audit rows (find them by run_id)")
 
