@@ -105,3 +105,11 @@ def test_the_logic_the_page_uses_passes_its_node_tests():
         ["node", "--test", "tests/js/lib.test.mjs"], cwd=ASSETS.parents[2], capture_output=True, text=True, timeout=120
     )
     assert done.returncode == 0, done.stdout[-2000:]
+
+
+def test_the_approvals_page_can_page_past_the_first_hundred_and_large_reports_are_capped():
+    source = (ASSETS / "app.js").read_text(encoding="utf-8")
+    assert "offset=${pendingOffset}" in source and "pendingOffset += PAGE" in source
+    assert "MAX_CASE_ROWS" in source and "cases.slice(0, MAX_CASE_ROWS)" in source
+    html = (ASSETS / "index.html").read_text(encoding="utf-8")
+    assert 'id="next-page"' in html and 'id="prev-page"' in html

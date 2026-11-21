@@ -29,8 +29,9 @@ from typing import Any
 import psycopg
 from pydantic import ValidationError
 
-from portcullis.audit import GENESIS, events, hook_run, namespaced, payload_data, require_project_database, verify
+from portcullis.audit import GENESIS, hook_run, namespaced, payload_data, read_verified, require_project_database, verify
 from portcullis.hook import HookError, load_policy
+from portcullis.jsondata import check_json
 from portcullis.keys import KeyEntry, hash_key, new_key
 from portcullis.policy import RunState, ToolCall, Verdict, decide
 
@@ -83,8 +84,7 @@ def _verify(args: argparse.Namespace, env: Mapping[str, str]) -> int:
 
 def _show(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     with connect(env) as conn:
-        rows = events(conn, _run(args))
-        result = verify(conn, _run(args))
+        result, rows = read_verified(conn, _run(args))  # the rows shown are the rows that were checked
     for row in rows:
         # json.dumps escapes control characters, so a logged value cannot inject terminal escapes
         print(json.dumps({**row, "payload": payload_data(row["payload"])}))
@@ -101,10 +101,14 @@ def _read_args(text: str) -> dict[str, Any]:
         value = json.loads(raw)
     except (OSError, UnicodeDecodeError) as exc:
         raise CliError(f"cannot read the arguments file ({type(exc).__name__})") from exc
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:  # RecursionError: absurdly nested JSON; exit 1 would mean "deny"
         raise CliError("--args is not valid JSON") from exc
     if not isinstance(value, dict):
         raise CliError("--args must be a JSON object")
+    try:
+        check_json(value)  # the same rule as the server: plain JSON data, 64-bit integers, limited nesting
+    except ValueError as exc:
+        raise CliError(f"--args is not plain JSON data ({exc})") from exc
     return value
 
 

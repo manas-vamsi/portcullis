@@ -233,3 +233,34 @@ def test_a_service_name_from_the_environment_is_used(monkeypatch):
         assert installed[0].resource.attributes["service.name"] == "my-gateway"
     finally:
         installed[0].shutdown()
+
+
+def test_an_exceptions_message_never_reaches_a_span(exporter, spans):
+    # A message can hold ids, run names or database details; only the exception's type is recorded.
+    with pytest.raises(RuntimeError):
+        with tracing.span("portcullis.test"):
+            raise RuntimeError("call_id 'SECRET-CALL-ID' in run acme-secret-run on host db.internal")
+    [finished] = exporter.get_finished_spans()
+    everything = str(finished.status.description) + str([dict(e.attributes) for e in finished.events]) + str(dict(finished.attributes))
+    assert "SECRET" not in everything and "db.internal" not in everything and "Traceback" not in everything
+    assert [dict(e.attributes) for e in finished.events] == [{"exception.type": "RuntimeError"}]
+    assert finished.status.description == "RuntimeError"
+
+
+def test_an_exception_with_tracing_off_still_propagates(monkeypatch):
+    monkeypatch.setattr(tracing, "trace", None)
+    with pytest.raises(KeyError):
+        with tracing.span("portcullis.test"):
+            raise KeyError("x")
+
+
+def test_a_span_that_cannot_record_a_failure_does_not_hide_the_exception(monkeypatch, spans):
+    from opentelemetry.sdk.trace import Span
+
+    def broken(self, *args, **kwargs):
+        raise RuntimeError("cannot set status")
+
+    monkeypatch.setattr(Span, "set_status", broken)
+    with pytest.raises(LookupError):
+        with tracing.span("portcullis.test"):
+            raise LookupError("x")

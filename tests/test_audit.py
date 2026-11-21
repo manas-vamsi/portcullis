@@ -148,3 +148,27 @@ def test_the_payload_is_stored_as_canonical_json(conn, run_id):
 
     assert stored == '{"a":[1,2],"b":1}'
     assert json.loads(stored) == {"a": [1, 2], "b": 1}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql://u@127.0.0.1:5433/portcullis?dbname=postgres",
+        "postgresql://u@127.0.0.1:5433/other",
+        "host=127.0.0.1 dbname=postgres",
+        "postgresql://u@127.0.0.1:5433/",
+        "not a url at all = = =",
+    ],
+)
+def test_the_database_guard_checks_the_name_the_driver_will_really_use(url):
+    from portcullis.audit import require_project_database
+
+    with pytest.raises(ValueError, match="portcullis"):
+        require_project_database(url)
+
+
+def test_the_database_guard_accepts_a_project_database():
+    from portcullis.audit import require_project_database
+
+    require_project_database("postgresql://u:p@127.0.0.1:5433/portcullis")
+    require_project_database("postgresql://u:p@127.0.0.1:5433/portcullis_test?sslmode=disable")

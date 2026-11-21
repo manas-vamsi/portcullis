@@ -14,7 +14,8 @@ So a cache hit never skips the check that history was not edited; it replaces re
 having the database confirm that nothing changed. (A cache cannot detect an attacker who rewrites the whole
 chain consistently, which plain verification cannot either; see the audit log's documented limits.)
 
-Callers get copies of the records, so what they do to them (they record an answer in memory after writing it)
+The checksum and the rows are read in one REPEATABLE READ transaction, so they describe the same
+snapshot of the log. Callers get copies of the records, so what they do to them (they record an answer in memory after writing it)
 never reaches the cache. Callers must hold the run's lock while loading it, which the server and hook do.
 """
 
@@ -65,12 +66,16 @@ class RunReader:
 
     def load(self, conn: psycopg.Connection, run: str) -> dict[str, CallRecord]:
         entry = self._recall(run)
-        total, digest, prefix_rows, prefix_digest = history_checksums(conn, run, entry.length if entry else 0)
-        if entry is not None and prefix_rows == entry.length and prefix_digest == entry.digest:
-            start, calls, head = entry.length, entry.calls, entry.head  # unchanged: continue from where it was verified
-        else:
-            start, calls, head = 0, {}, GENESIS
-        rows = fetch_rows(conn, run, start)
+        # One snapshot for both reads: otherwise an edit that is in place for the checksum and undone before the
+        # fetch (or the reverse) would pair a digest with rows it does not describe, and poison the cache.
+        with conn.transaction():
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            total, digest, prefix_rows, prefix_digest = history_checksums(conn, run, entry.length if entry else 0)
+            if entry is not None and prefix_rows == entry.length and prefix_digest == entry.digest:
+                start, calls, head = entry.length, entry.calls, entry.head  # unchanged: continue where it was verified
+            else:
+                start, calls, head = 0, {}, GENESIS
+            rows = fetch_rows(conn, run, start)
         checked = check_rows(run, rows, start, head)
         if not checked.ok:
             raise ChainBroken(run)  # the entry (if any) is untouched: the new rows were not folded into it
@@ -79,9 +84,6 @@ class RunReader:
         except InconsistentRun as exc:
             self._remember(run, None)
             raise ChainBroken(run) from exc
-        if start + len(rows) == total:  # the digest describes exactly the rows used; otherwise do not trust it
-            self._remember(run, _Entry(total, checked.head, digest, calls))
-        else:
-            self._remember(run, None)
+        self._remember(run, _Entry(total, checked.head, digest, calls))  # same snapshot: the digest describes these rows
         return {call_id: replace(record) for call_id, record in calls.items()}
 

@@ -60,3 +60,14 @@ test("an arguments preview becomes plain lines of text and says when it was cut"
   assert.deepEqual(previewLines({}), ["(no preview: the arguments were not stored)"]);
   assert.deepEqual(previewLines({ args_preview: 5 }), ["(no preview: the arguments were not stored)"]);
 });
+
+test("a hostile case id such as __proto__ stays an ordinary key and pollutes nothing", () => {
+  const s = summarize([outcome("__proto__", 0, true), outcome("constructor", 0, false), outcome("a", 0, true)]);
+  assert.equal(s.cases, 3);
+  assert.deepEqual(Object.keys(s.perCase).sort(), ["__proto__", "a", "constructor"]);
+  assert.equal(({}).runs, undefined);
+  assert.equal(s.passRate, 2 / 3);
+  const r = summarize([outcome("a", 0, true, { refused: { __proto__: 5 } })]);
+  assert.equal(({}).passed, undefined);
+  assert.ok(r);
+});

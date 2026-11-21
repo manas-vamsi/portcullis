@@ -7,6 +7,9 @@ import { previewLines, shortHash, summarize } from "./lib.js";
 
 let apiKey = "";
 let timer = null;
+let pendingOffset = 0;
+const PAGE = 100; // the server sends at most this many pending calls at a time
+const MAX_CASE_ROWS = 500; // a results file with more cases is summarised, not drawn row by row
 
 const $ = (id) => document.getElementById(id);
 
@@ -79,8 +82,14 @@ async function answer(entry, approved, row) {
 async function loadPending() {
   const box = $("pending");
   try {
-    const { pending } = await api("GET", "/v1/approvals?limit=100");
+    const { pending } = await api("GET", `/v1/approvals?limit=${PAGE}&offset=${pendingOffset}`);
     box.replaceChildren();
+    // Paging, so a flood of requests cannot hide newer ones behind the oldest hundred.
+    $("prev-page").disabled = pendingOffset === 0;
+    $("next-page").disabled = pending.length < PAGE;
+    $("page-note").textContent = pending.length
+      ? `Showing ${pendingOffset + 1} to ${pendingOffset + pending.length}${pending.length === PAGE ? " (there may be more)" : ""}`
+      : "";
     if (!pending.length) { box.append(el("p", "Nothing is waiting.", "note")); return; }
     const rows = pending.map((entry) => {
       const preview = el("pre", previewLines(entry).join("\n"));
@@ -153,7 +162,9 @@ async function showResults(event) {
       ["Mean tokens / tool calls", `${s.meanTokens.toFixed(0)} / ${s.meanToolCalls.toFixed(1)}`],
       ["Calls refused, by rule", Object.keys(s.refused).length ? Object.entries(s.refused).map(([r, n]) => `${r} ${n}`).join(", ") : "none"],
     ]));
-    box.append(table(["Case", "Passed"], Object.entries(s.perCase).map(([id, c]) => [id, `${c.passed}/${c.runs}`])));
+    const cases = Object.entries(s.perCase);
+    box.append(table(["Case", "Passed"], cases.slice(0, MAX_CASE_ROWS).map(([id, c]) => [id, `${c.passed}/${c.runs}`])));
+    if (cases.length > MAX_CASE_ROWS) box.append(el("p", `${cases.length - MAX_CASE_ROWS} more cases not shown.`, "note"));
     if (s.forbiddenExecuted > 0) say("A forbidden action ran in this results file.", true); else say("");
   } catch (error) {
     box.replaceChildren();
@@ -173,6 +184,8 @@ function start() {
   $("key-form").addEventListener("submit", (e) => e.preventDefault());
   document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
   $("load-pending").addEventListener("click", loadPending);
+  $("prev-page").addEventListener("click", () => { pendingOffset = Math.max(0, pendingOffset - PAGE); loadPending(); });
+  $("next-page").addEventListener("click", () => { pendingOffset += PAGE; loadPending(); });
   $("auto").addEventListener("change", (e) => {
     clearInterval(timer);
     timer = e.target.checked ? setInterval(loadPending, 10_000) : null;

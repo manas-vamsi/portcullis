@@ -81,8 +81,16 @@ def lock_key(name: str) -> int:
 
 
 def require_project_database(url: str) -> None:
-    """Refuse a database not named for this project, in case a URL points at someone else's."""
-    if not urlparse(url).path.lstrip("/").startswith("portcullis"):
+    """Refuse a database not named for this project, in case a URL points at someone else's.
+
+    The name is the one the driver will actually connect to, so `.../portcullis?dbname=postgres` is refused too."""
+    from psycopg.conninfo import conninfo_to_dict
+
+    try:
+        name = str(conninfo_to_dict(url).get("dbname") or "")
+    except Exception:  # an unparseable URL is not a project database either
+        name = ""
+    if not (urlparse(url).path.lstrip("/").startswith("portcullis") and name.startswith("portcullis")):
         raise ValueError("the database name must start with 'portcullis'")
 
 

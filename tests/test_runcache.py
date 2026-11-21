@@ -195,22 +195,49 @@ def test_least_recently_used_runs_are_forgotten_beyond_the_capacity(conn, monkey
         conn.execute("DELETE FROM audit_log WHERE run_id = ANY(%s)", (names,))
 
 
-def test_rows_that_appear_between_the_checksum_and_the_fetch_are_used_but_not_cached(conn, run, monkeypatch):
-    reader = RunReader()
+def test_a_row_another_writer_adds_during_a_load_is_left_for_the_next_load(conn, run, postgres_url, monkeypatch):
+    import psycopg
+
+    reader, real = RunReader(), runcache.history_checksums
     add(conn, run, "a")
-    real = runcache.history_checksums
+    with psycopg.connect(postgres_url, autocommit=True) as other:
 
-    def racing(connection, name, prefix):
-        result = real(connection, name, prefix)
-        add(connection, name, "late")  # another writer slips in after the checksum was taken
-        return result
+        def racing(connection, name, prefix):
+            result = real(connection, name, prefix)
+            add(other, name, "late")  # committed by someone else after the checksum was taken
+            return result
 
-    monkeypatch.setattr(runcache, "history_checksums", racing)
-    assert list(reader.load(conn, run)) == ["a", "late"]  # the verified rows are all used
+        monkeypatch.setattr(runcache, "history_checksums", racing)
+        assert list(reader.load(conn, run)) == ["a"]  # one consistent snapshot: the checksum and rows agree
+        monkeypatch.setattr(runcache, "history_checksums", real)
+    assert list(reader.load(conn, run)) == ["a", "late"]  # and the next load picks the new row up
+
+
+def test_an_edit_undone_between_the_checksum_and_the_fetch_cannot_poison_the_cache(conn, run, postgres_url, monkeypatch):
+    # The reviewer's attack: tamper, let the checksum see it, restore before the rows are read, then tamper
+    # again. With both reads in one snapshot the first load sees the tampered rows and refuses them.
+    import psycopg
+
+    reader, real = RunReader(), runcache.history_checksums
+    add(conn, run, "c0")
+    add(conn, run, "c1")
+    original = conn.execute("SELECT payload FROM audit_log WHERE run_id = %s AND idx = 1", (run,)).fetchone()[0]
+    tampered = json.dumps(decision("c1", "deny", "forbidden_argument"))
+    conn.execute("UPDATE audit_log SET payload = %s WHERE run_id = %s AND idx = 1", (tampered, run))
+    with psycopg.connect(postgres_url, autocommit=True) as other:
+
+        def restore_after_checksum(connection, name, prefix):
+            result = real(connection, name, prefix)
+            other.execute("UPDATE audit_log SET payload = %s WHERE run_id = %s AND idx = 1", (original, name))
+            return result
+
+        monkeypatch.setattr(runcache, "history_checksums", restore_after_checksum)
+        with pytest.raises(ChainBroken):
+            reader.load(conn, run)
     monkeypatch.setattr(runcache, "history_checksums", real)
-    starts = fetches(monkeypatch)
-    reader.load(conn, run)
-    assert starts == [0]  # but nothing was cached on that uncertain basis: this read starts over
+    conn.execute("UPDATE audit_log SET payload = %s WHERE run_id = %s AND idx = 1", (tampered, run))  # tamper again
+    with pytest.raises(ChainBroken):
+        reader.load(conn, run)
 
 
 def test_a_reader_with_no_room_still_reads_correctly(conn, run):

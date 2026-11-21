@@ -25,9 +25,10 @@ export function percentile(sorted, fraction) {
 // A summary computed from the outcomes themselves, never taken from a file's own "summary" field.
 export function summarize(outcomes) {
   if (!Array.isArray(outcomes) || outcomes.length === 0) throw new Error("there are no outcomes to summarize");
-  const perCase = {};
-  const byCategory = {};
-  const refused = {};
+  // Prototype-free objects: a case id such as "__proto__" from a hostile file must stay an ordinary key.
+  const perCase = Object.create(null);
+  const byCategory = Object.create(null);
+  const refused = Object.create(null);
   let passed = 0, errors = 0, forbidden = 0, tokens = 0, calls = 0;
   for (const o of outcomes) {
     const entry = (perCase[o.case_id] ??= { runs: 0, passed: 0 });
@@ -56,7 +57,8 @@ export function summarize(outcomes) {
     meanToolCalls: calls / outcomes.length,
     secondsP50: percentile(answered, 0.5),
     secondsP95: percentile(answered, 0.95),
-    refused,
-    perCase,
+    // Back to ordinary objects; fromEntries defines each key as its own property, so "__proto__" stays a key.
+    refused: Object.fromEntries(Object.entries(refused)),
+    perCase: Object.fromEntries(Object.entries(perCase)),
   };
 }

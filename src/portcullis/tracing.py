@@ -11,7 +11,8 @@ is hashed so traces can be grouped by run without revealing the name.
 
 Rules this module keeps:
 - It never gets in the way. If the tracing library is missing, misconfigured or broken, the work goes on and
-  nothing is emitted. An exception from the traced work still propagates (and is recorded on the span).
+  nothing is emitted. An exception from the traced work still propagates; the span records only its type name,
+  never its message or stack trace (a message can hold ids, run names or database details).
 - It costs little when it is off: with no provider installed OpenTelemetry's own no-op tracer is used. Measured
   on one machine, a traced decision adds about 12 microseconds with the library installed and no provider, about
   2 without the library, and about 49 when recording to memory, against a server decision of tens of milliseconds.
@@ -57,15 +58,38 @@ def _tracer() -> Any:
 @contextmanager
 def span(name: str, **attributes: Any) -> Iterator[None]:
     """A span around the body, with the allowed attributes. Never raises on its own account."""
-    stack = ExitStack()
+    stack, current = ExitStack(), None
     try:
         tracer = _tracer()
         if tracer is not None:
-            stack.enter_context(tracer.start_as_current_span(name, attributes=_clean(attributes)))
+            # OpenTelemetry would otherwise copy an exception's message and stack trace onto the span, and a
+            # message can hold ids, run names or database details. Only the exception's type is recorded.
+            current = stack.enter_context(
+                tracer.start_as_current_span(
+                    name, attributes=_clean(attributes), record_exception=False, set_status_on_exception=False
+                )
+            )
     except Exception:  # tracing must never get in the way
-        stack = ExitStack()
-    with stack:  # passes an exception from the body to the span, which records it and lets it continue
-        yield
+        stack, current = ExitStack(), None
+    with stack:
+        try:
+            yield
+        except BaseException as exc:
+            _mark_failed(current, exc)
+            raise
+
+
+def _mark_failed(current: Any, exc: BaseException) -> None:
+    """Error status and an `exception` event with the type name only: never the message or the stack trace."""
+    if current is None:
+        return
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        current.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+        current.add_event("exception", {"exception.type": type(exc).__name__})
+    except Exception:  # tracing must never get in the way
+        pass
 
 
 def annotate(**attributes: Any) -> None:

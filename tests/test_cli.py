@@ -255,3 +255,28 @@ def test_no_command_or_an_unknown_command_exits_2(capsys):
 def test_the_agentctl_script_is_registered():
     project = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["project"]["scripts"]["agentctl"] == "portcullis.cli:main"
+
+
+def test_absurdly_nested_args_are_a_usage_error_not_a_deny(tmp_path, capsys):
+    deep = tmp_path / "deep.json"
+    deep.write_text("[" * 200_000 + "]" * 200_000, encoding="utf-8")
+    assert check("Read", f"@{deep}") == 2  # exit 1 would read as "deny"
+    assert "agentctl:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("args", ['{"n": 18446744073709551616}', '{"a": ' + "[" * 40 + "]" * 40 + "}"])
+def test_args_the_server_would_refuse_are_refused_here_too(args, capsys):
+    assert check("Read", args) == 2
+    err = capsys.readouterr().err
+    assert "plain JSON data" in err or "not valid JSON" in err
+
+
+def test_show_reports_the_rows_it_checked(conn, run_id, env, capsys, monkeypatch):
+    import portcullis.cli as cli
+
+    reads = []
+    real = cli.read_verified
+    monkeypatch.setattr(cli, "read_verified", lambda c, r: reads.append(r) or real(c, r))
+    append(conn, run_id, "t1", "e0", "decision", {"n": 0})
+    assert main(["show", run_id], env) == 0 and reads == [run_id]
+    capsys.readouterr()
