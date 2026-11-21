@@ -18,7 +18,7 @@ The hook stays a plain process per call. It still fails closed, and its cost is 
 ## Consequences
 
 - Good: nothing the agent can edit decides whether the agent is allowed to do something, beyond the policy file (which the README already says must be made read-only or owned by another user).
-- Bad: every tool call is slower. If the cost matters, a faster-starting implementation of the same logic is the honest fix, and it is not built.
+- Bad: every tool call is slower. Profiled on one machine (`python -X importtime`): starting Python takes about 0.15 s, defining the policy's validation models about 0.31 s and importing Pydantic about 0.12 s; everything else is small. Every one of those models is used on each call, so deferring them saves nothing. If the cost matters, a faster-starting implementation of the same logic (another language) is the honest fix, and it is not built.
 
 ## Where
 
