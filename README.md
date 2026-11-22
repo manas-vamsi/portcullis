@@ -290,6 +290,17 @@ What this says in plain words:
 
 Rerun with `uv run --env-file .env python benchmarks/run.py --out results.json` (`--quick` is a smoke test, not a measurement). It removes every row it writes.
 
+## Same policy, three entry points
+
+`tests/test_surface_parity.py` sends one set of 10 calls (allowed, refused for several reasons, and needing approval) to the policy engine, the Claude Code hook, the server and the MCP proxy, each on fresh state. All three give the same verdict and the same rule as the engine for every call. The MCP proxy is the one exception for "ask": it shows the person an approval prompt and does not tell the model the rule.
+
+They differ on purpose in two places, and a test pins each one:
+
+- **A tool that no longer exists.** Only the MCP proxy asks the real server which tools it has, so only it refuses a call to a tool the policy allows but the server no longer offers (`tool_unavailable`).
+- **Pinned tools.** The proxy reads each tool's real definition and the server takes the hash its caller sends, so a pinned tool passes both. Claude Code does not send the hook a tool definition, so a pinned rule in a hook policy refuses every call (`definition_drift`). Do not pin Claude Code tools.
+
+What each entry point costs per call is in "Measured costs" above: microseconds in process, about 30 to 42 ms through the server, about 0.4 to 1.0 s through the hook, and about 2 ms added by the proxy. Those numbers come from separate benchmarks on one laptop, not from one side-by-side run.
+
 ## Tracing
 
 Optional OpenTelemetry spans for decisions, off unless you turn it on. Install with `uv sync --extra tracing`, then set an OTLP endpoint and run the server (the usual `OTEL_*` variables, such as `OTEL_SERVICE_NAME`, apply):
