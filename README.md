@@ -10,7 +10,7 @@ Portcullis sits in front of an agent's tools and decides, with plain determinist
 >
 > **Built, each with tests behind it:** the deterministic policy engine (allow, deny or ask; allowlists, argument rules, amounts, budgets, loop detection, per-run and per-tenant daily spend caps, tool-definition pinning); a guarded LangGraph agent loop with human approval, an idempotency ledger and crash recovery; a hash-chained audit log; an HTTP server with API keys, approver roles and hot-reloaded policy; a dashboard; a Claude Code hook; a proxy that puts the policy in front of any MCP server; a portable skill file; the `agentctl` CLI; an attack suite; an eval harness with an OpenAI-compatible model adapter; benchmarks and decision records.
 >
-> **Not built, or not done:** only one small local model has been run through the evals (a larger model, and the fixes that run pointed to, are next); a code sandbox; the three-surface (MCP, CLI, library) comparison; a faster Claude Code hook (it adds about 0.7 to 1.0 seconds a call); the dashboard and the MCP proxy have not been tried in a real browser or with a third-party MCP client.
+> **Not built, or not done:** only one small local model has been run through the evals (a larger model, and the fixes that run pointed to, are next); a code sandbox; the three-surface comparison with a real model in the loop (the decision parity check across the hook, server and MCP proxy is done, see "Same policy, three entry points"); a faster Claude Code hook (it adds about 0.4 to 1.0 seconds a call); the dashboard and the MCP proxy have not been tried in a real browser or with a third-party MCP client.
 >
 > A feature is marked as built only when it has tests behind it. Numbers appear only when they were measured, and weaknesses are written down (see "Known limits") and pinned by tests.
 
@@ -358,13 +358,13 @@ In use: Python 3.12, uv, LangGraph, Postgres (Docker) through psycopg, FastAPI, 
 
 ## Roadmap
 
-Done: the policy engine; the guarded LangGraph loop with approvals, budgets, checkpoint and resume; the audit log and the dashboard; the HTTP server; the Claude Code plugin hook; the MCP proxy, CLI and skill; the executable attack suite; the eval harness; benchmarks; decision records.
+Done: the policy engine; the guarded LangGraph loop with approvals, budgets, checkpoint and resume; the audit log and the dashboard; the HTTP server; the Claude Code plugin hook; the MCP proxy, CLI and skill; the executable attack suite; the eval harness and two real-model runs with a small local model; a decision parity check across the hook, server and MCP proxy; benchmarks; decision records.
 
 Not done:
 
-1. A first real-model run of the evals (needs a model endpoint; the harness and adapter are ready), then publishing the numbers with the model name, run count and case-file hash.
-2. A faster Claude Code hook (a long-running process, or an implementation that starts faster).
-3. A code sandbox, and the three-surface comparison (MCP, CLI, library) on the demo agent. The comparison needs a real model.
+1. An eval run with a larger model (the 7B attempt did not fit in this laptop's memory; see "A larger model did not fit on this laptop").
+2. A faster Claude Code hook. Profiled on this machine: most of each call is starting Python, opening about 120 module files and loading Pydantic and the policy's models; switching off Pydantic's plugin loader made no measurable difference. A real fix means a hook path that does not load Pydantic (a second implementation of the checks, kept honest by the parity test), and timing it needs a machine that is not short of memory. A long-running process is ruled out (ADR-0013).
+3. A code sandbox, and a three-surface comparison with a real model driving the demo agent through each entry point.
 4. Trying the dashboard in real browsers, the MCP proxy with real clients, and tracing against a real collector.
 
 ## Getting started
