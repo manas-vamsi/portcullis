@@ -262,6 +262,30 @@ def test_the_launcher_runs_the_hook_in_process_when_portcullis_is_importable(pol
     assert result.stderr.decode().startswith("Portcullis [forbidden_argument]")
 
 
+def test_the_launcher_uses_the_fast_hook_by_default_and_it_does_not_load_pydantic(policy_file, tmp_path):
+    # Wrap the launcher so it also reports whether pydantic was imported.
+    probe = tmp_path / "probe.py"
+    lines = [
+        "import runpy, sys",
+        "try:",
+        f"    runpy.run_path({str(LAUNCHER)!r}, run_name='__main__')",
+        "finally:",
+        "    sys.stderr.write('PYDANTIC=%s' % ('pydantic' in sys.modules))",
+    ]
+    probe.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("PORTCULLIS_")}
+    run_probe = lambda **env: subprocess.run(  # noqa: E731
+        [sys.executable, str(probe)], input=event("Bash", {"command": "rm -rf /"}), capture_output=True,
+        env={**clean, "PORTCULLIS_POLICY": str(policy_file), **env}, timeout=60,
+    )
+
+    fast = run_probe()
+    assert fast.returncode == 2 and fast.stderr.decode().startswith("Portcullis [forbidden_argument]")
+    assert fast.stderr.decode().endswith("PYDANTIC=False")
+    full = run_probe(PORTCULLIS_HOOK_MODULE="portcullis.hook")
+    assert full.returncode == 2 and full.stderr.decode().endswith("PYDANTIC=True")
+
+
 @pytest.mark.parametrize(
     "module_source",
     ["raise AttributeError('version mismatch')", "raise KeyboardInterrupt", "def run(data, env):\n    raise SystemExit(1)"],

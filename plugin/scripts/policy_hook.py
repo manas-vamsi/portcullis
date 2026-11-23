@@ -5,7 +5,9 @@ also lets a call through when a hook times out. A Python import failure or an un
 exits with 1. So this launcher turns every failure into exit 2, which blocks the call, and a
 watchdog kills a hung hook with exit 2 before Claude Code's own timeout can let the call through.
 
-It runs portcullis.hook in this Python if it can be imported. If portcullis is not importable
+It runs portcullis.quickhook in this Python if it can be imported. That decides plainly valid
+policies without loading pydantic and hands everything else to the full hook, portcullis.hook
+(set PORTCULLIS_HOOK_MODULE=portcullis.hook to always use the full one). If portcullis is not importable
 here, it delegates to the Python named by PORTCULLIS_PYTHON (the interpreter of the environment
 where portcullis is installed). With neither, it blocks.
 
@@ -19,7 +21,7 @@ import subprocess
 import sys
 import threading
 
-MODULE = os.environ.get("PORTCULLIS_HOOK_MODULE", "portcullis.hook")
+MODULE = os.environ.get("PORTCULLIS_HOOK_MODULE", "portcullis.quickhook")
 # Both must stay below the hook timeout in hooks.json (30): this launcher has to give up first.
 DEFAULT_DEADLINE_SECONDS = 20  # the whole hook, any path
 DELEGATE_TIMEOUT_SECONDS = 15  # the delegated Python, inside that

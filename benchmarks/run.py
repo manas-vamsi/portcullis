@@ -6,7 +6,8 @@ Benchmarks (each is a function below; all numbers are wall-clock times on whatev
   policy   one policy decision, in process, no I/O
   audit    appending to and verifying a hash chain in Postgres
   server   a decision over real HTTP on loopback, and how it changes as the run's log grows
-  hook     the Claude Code hook as a fresh process per call, with and without a database
+  hook     the Claude Code hook as a fresh process per call: the full hook with and without a database,
+           and the fast hook (portcullis.quickhook), which needs no database
   mcp      what the MCP proxy adds to one tool call (in memory, no process boundary)
 
 What the numbers are not: a comparison, a load test, or a claim about any other machine, database or
@@ -205,7 +206,14 @@ def bench_hook(quick: bool, url: str, **_: Any) -> dict[str, Any]:
         base_env = {k: v for k, v in os.environ.items() if not k.startswith("PORTCULLIS_")}
         base_env.update(PORTCULLIS_POLICY=str(policy_file), PORTCULLIS_TENANT=TENANT, PYTHONPATH=str(ROOT / "src"))
         session = f"bench-{uuid.uuid4().hex[:8]}"
-        for label, env in (("no_database", base_env), ("with_database", {**base_env, "PORTCULLIS_DATABASE_URL": url})):
+        full = {**base_env, "PORTCULLIS_HOOK_MODULE": "portcullis.hook"}
+        fast = {**base_env, "PORTCULLIS_HOOK_MODULE": "portcullis.quickhook"}  # decides without pydantic when it can
+        runs = (
+            ("no_database", full),
+            ("no_database_fast", fast),
+            ("with_database", {**full, "PORTCULLIS_DATABASE_URL": url}),
+        )
+        for label, env in runs:
             samples = []
             for i in range(n):
                 event = json.dumps({"tool_name": "read", "tool_input": {"n": i}, "session_id": f"{session}-{label}", "tool_use_id": f"t{i}"})

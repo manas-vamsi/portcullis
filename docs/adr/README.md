@@ -19,3 +19,4 @@ known cost or gap, the record says so.
 | 11 | [The dashboard is plain HTML and JavaScript served by the server](0011-dashboard-as-static-files.md) |
 | 12 | [Nothing is claimed that is not built, tested or measured, and weaknesses are pinned by tests](0012-evidence-before-claims.md) |
 | 13 | [The Claude Code hook does not use a background process to go faster](0013-no-background-process-for-the-hook.md) |
+| 14 | [A faster hook that reads plain policies without pydantic, shares the rules, and hands everything else on](0014-fast-hook-shares-the-rules.md) |

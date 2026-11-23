@@ -16,7 +16,7 @@ from uuid import uuid4
 import pytest
 from mcp import types
 
-from portcullis import hook
+from portcullis import hook, quickhook
 from portcullis.mcp_proxy import Governor, definition_sha
 from portcullis.policy import (
     ArgPattern,
@@ -76,9 +76,9 @@ def via_engine(tenant, tool, args):
     return decision.verdict.value, None if decision.verdict.value == "allow" else decision.rule  # hook and MCP name no rule on allow
 
 
-def via_hook(tenant, tool, args, policy_file):
+def via_hook(tenant, tool, args, policy_file, entry=hook.run):
     event = {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": args, "session_id": "s"}
-    code, out, err = hook.run(json.dumps(event).encode(), {"PORTCULLIS_POLICY": str(policy_file), "PORTCULLIS_TENANT": tenant})
+    code, out, err = entry(json.dumps(event).encode(), {"PORTCULLIS_POLICY": str(policy_file), "PORTCULLIS_TENANT": tenant})
     if code == 2:
         return "deny", re.search(r"\[(\w+)\]", err).group(1)
     if not out:
@@ -168,6 +168,11 @@ def test_the_engine_gives_the_expected_answer(tenant, tool, args, verdict, rule)
 @pytest.mark.parametrize("tenant, tool, args, verdict, rule", CASES, ids=IDS)
 def test_the_hook_agrees_with_the_engine(tenant, tool, args, verdict, rule, policy_file):
     assert via_hook(tenant, tool, args, policy_file) == via_engine(tenant, tool, args)
+
+
+@pytest.mark.parametrize("tenant, tool, args, verdict, rule", CASES, ids=IDS)
+def test_the_fast_hook_agrees_with_the_engine(tenant, tool, args, verdict, rule, policy_file):
+    assert via_hook(tenant, tool, args, policy_file, quickhook.run) == via_engine(tenant, tool, args)
 
 
 @pytest.mark.parametrize("tenant, tool, args, verdict, rule", CASES, ids=IDS)

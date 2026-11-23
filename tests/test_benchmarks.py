@@ -50,7 +50,7 @@ def test_the_server_benchmark_measures_growing_runs_and_removes_its_rows(postgre
 
 def test_the_hook_benchmark_times_a_real_process_with_and_without_a_database(postgres_url, conn):
     result = bench.bench_hook(quick=True, url=postgres_url)
-    assert set(result) == {"no_database", "with_database"} and all(r["n"] == 8 for r in result.values())
+    assert set(result) == {"no_database", "no_database_fast", "with_database"} and all(r["n"] == 8 for r in result.values())
     assert leftovers(conn) == 0
 
 
